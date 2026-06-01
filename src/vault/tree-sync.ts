@@ -40,6 +40,13 @@ export interface SyncOptions {
 	 */
 	onFileMapped?: (path: string, mapping: FileMapping) => void;
 	onOrgMapped?: (folderName: string, orgId: string) => void;
+	/**
+	 * Called ONCE after listOrgs returns with the full org → effective_permissions
+	 * map. Use this to refresh the plugin's permission cache atomically.
+	 * Orgs whose response omits effective_permissions fall back to 0
+	 * (no access — safest default).
+	 */
+	onOrgPermissions?: (perms: Record<string, number>) => void | Promise<void>;
 }
 
 export interface SyncResult {
@@ -59,6 +66,13 @@ export async function syncOrgTrees(
 	await ensureFolder(vault, opts.mayaspaceRoot);
 
 	const orgs = await api.listOrgs();
+
+	if (opts.onOrgPermissions) {
+		const perms: Record<string, number> = {};
+		for (const o of orgs) perms[o.id] = o.effective_permissions ?? 0;
+		await opts.onOrgPermissions(perms);
+	}
+
 	for (const org of orgs) {
 		const folderName = sanitizeFolderName(org.name);
 		result.orgs[folderName] = org.id;

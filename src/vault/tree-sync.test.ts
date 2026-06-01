@@ -173,3 +173,35 @@ describe("syncOrgTrees", () => {
 		});
 	});
 });
+
+describe("syncOrgTrees — onOrgPermissions", () => {
+	test("passes effective_permissions per org to the callback", async () => {
+		const onOrgPermissions = jest.fn();
+		const api: ApiLike = {
+			listOrgs: async () => [
+				{ id: "org-a", name: "A", role: "admin", effective_permissions: 31 },
+				{ id: "org-b", name: "B", role: "member", effective_permissions: 1 },
+			],
+			getTree: async () => [],
+		};
+		await syncOrgTrees(makeVault().vault, api, {
+			mayaspaceRoot: "MayaSpace",
+			onOrgPermissions,
+		});
+		expect(onOrgPermissions).toHaveBeenCalledTimes(1);
+		expect(onOrgPermissions).toHaveBeenCalledWith({ "org-a": 31, "org-b": 1 });
+	});
+
+	test("falls back to 0 when effective_permissions is missing", async () => {
+		const onOrgPermissions = jest.fn();
+		const api: ApiLike = {
+			listOrgs: async () => [{ id: "org-c", name: "C", role: "member" }],
+			getTree: async () => [],
+		};
+		await syncOrgTrees(makeVault().vault, api, {
+			mayaspaceRoot: "MayaSpace",
+			onOrgPermissions,
+		});
+		expect(onOrgPermissions).toHaveBeenCalledWith({ "org-c": 0 });
+	});
+});

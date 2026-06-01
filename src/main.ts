@@ -459,6 +459,12 @@ export default class MayaspacePlugin extends Plugin {
 				onOrgMapped: (folderName, orgId) => {
 					this.settings.orgMappings[folderName] = orgId;
 				},
+				onOrgPermissions: async (perms) => {
+					this.settings.orgPermissions = perms;
+					// saveSettings happens at the end of syncTrees, but make it explicit here
+					// so the cache is durable even if a later step in syncTrees throws.
+					await this.saveSettings();
+				},
 			},
 		);
 		this.settings.orgMappings = result.orgs;
