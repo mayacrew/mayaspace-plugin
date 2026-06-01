@@ -12,7 +12,14 @@
 import type { MayaspaceAuth } from "../auth/mayaspace-auth";
 import type { Fetcher, HttpRequest, HttpResponse } from "./mayaspace-http";
 
-export interface Org { id: string; name: string; role?: "admin" | "member"; created_at?: string; }
+export interface Org {
+	id: string;
+	name: string;
+	role?: "admin" | "member";
+	created_at?: string;
+	/** R|U|C|D bits at root path. Server computes from base bits + ACL rules. */
+	effective_permissions?: number;
+}
 export interface OrgMember { user_id: string; role: string; }
 export interface FileMeta { id: string; path: string; etag?: string; mtime?: string; size?: number; }
 export interface UserInfo { id: string; email: string; deviceId?: string; }
