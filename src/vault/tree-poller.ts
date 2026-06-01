@@ -31,6 +31,12 @@ export interface PollerHooks {
 	removeFileMapping(path: string): Promise<void>;
 	sanitizeOrgFolderName(name: string): string;
 	mayaspaceRoot(): string;
+	/**
+	 * Called once per tick with the full org → effective_permissions snapshot.
+	 * Without this, admin's permission changes never reach the plugin until
+	 * the next explicit syncTrees (logout/relogin or manual "Sync now").
+	 */
+	onOrgPermissions?(perms: Record<string, number>): Promise<void> | void;
 	onError?(e: unknown): void;
 }
 
@@ -63,6 +69,11 @@ export class TreePoller {
 		this.running = true;
 		try {
 			const orgs = await this.api.listOrgs();
+			if (this.hooks.onOrgPermissions) {
+				const perms: Record<string, number> = {};
+				for (const o of orgs) perms[o.id] = o.effective_permissions ?? 0;
+				await this.hooks.onOrgPermissions(perms);
+			}
 			for (const org of orgs) {
 				await this.reconcileOrg(org);
 			}

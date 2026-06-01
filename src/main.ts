@@ -471,33 +471,7 @@ export default class MayaspacePlugin extends Plugin {
 				onOrgMapped: (folderName, orgId) => {
 					this.settings.orgMappings[folderName] = orgId;
 				},
-				onOrgPermissions: async (perms) => {
-					const prev = { ...this.settings.orgPermissions };
-					this.settings.orgPermissions = perms;
-					// saveSettings happens at the end of syncTrees, but make it explicit here
-					// so the cache is durable even if a later step in syncTrees throws.
-					await this.saveSettings();
-
-					for (const orgId of new Set([...Object.keys(prev), ...Object.keys(perms)])) {
-						const before = prev[orgId] ?? 0;
-						const after = perms[orgId] ?? 0;
-						const lostRead = !!(before & READ) && !(after & READ);
-						const lostUpdate = !!(before & UPDATE) && !(after & UPDATE);
-						if (!lostRead && !lostUpdate) continue;
-
-						for (const [path, m] of Object.entries(this.settings.fileMappings)) {
-							if (m.orgId !== orgId) continue;
-							if (this.liveCollab.activePaths().includes(path)) {
-								await this.liveCollab.detach(path).catch(() => undefined);
-							}
-							if (lostRead) {
-								this.stopPrefetch(path);
-							}
-						}
-						if (lostRead) new Notice("MayaSpace: 읽기 권한이 회수되었습니다.");
-						else if (lostUpdate) new Notice("MayaSpace: 편집 권한이 회수되었습니다.");
-					}
-				},
+				onOrgPermissions: (perms) => this.applyOrgPermissions(perms),
 			},
 		);
 		this.settings.orgMappings = result.orgs;
@@ -634,11 +608,44 @@ export default class MayaspacePlugin extends Plugin {
 				},
 				sanitizeOrgFolderName: sanitizeFolderName,
 				mayaspaceRoot: () => this.settings.mayaspaceRoot,
+				// Same diff+detach logic as syncTrees — admin's permission changes
+				// must reach the plugin via the periodic poll, not just on next login.
+				onOrgPermissions: (perms) => this.applyOrgPermissions(perms),
 				onError: (e) => console.warn("[mayaspace] poller", e),
 			},
 			this.settings.treePollIntervalSec * 1000,
 		);
 		this.treePoller.start();
+	}
+
+	/**
+	 * Replace orgPermissions cache and detach affected sessions when bits shrink.
+	 * Called from both syncTrees (login + manual) and tree-poller (every 30s).
+	 */
+	private async applyOrgPermissions(perms: Record<string, number>): Promise<void> {
+		const prev = { ...this.settings.orgPermissions };
+		this.settings.orgPermissions = perms;
+		await this.saveSettings();
+
+		for (const orgId of new Set([...Object.keys(prev), ...Object.keys(perms)])) {
+			const before = prev[orgId] ?? 0;
+			const after = perms[orgId] ?? 0;
+			const lostRead = !!(before & READ) && !(after & READ);
+			const lostUpdate = !!(before & UPDATE) && !(after & UPDATE);
+			if (!lostRead && !lostUpdate) continue;
+
+			for (const [path, m] of Object.entries(this.settings.fileMappings)) {
+				if (m.orgId !== orgId) continue;
+				if (this.liveCollab.activePaths().includes(path)) {
+					await this.liveCollab.detach(path).catch(() => undefined);
+				}
+				if (lostRead) {
+					this.stopPrefetch(path);
+				}
+			}
+			if (lostRead) new Notice("MayaSpace: 읽기 권한이 회수되었습니다.");
+			else if (lostUpdate) new Notice("MayaSpace: 편집 권한이 회수되었습니다.");
+		}
 	}
 
 	// ---------- SSE ----------
