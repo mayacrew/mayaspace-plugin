@@ -1,0 +1,211 @@
+/**
+ * MayaSpace Hocuspocus provider wrapper.
+ *
+ * Each (orgId, fileId) maps to a unique doc name:
+ *   `org:{orgId}:file:{fileId}`
+ *
+ * Owns the Y.Doc lifecycle: Hocuspocus creates and destroys the doc.
+ * The Obsidian editor binding consumes `handle.doc` and `handle.awareness`.
+ *
+ * Provider creation is factory-injected so unit tests don't depend on a real
+ * WebSocket. The default factory creates a real HocuspocusProvider; tests
+ * pass a mock factory.
+ */
+
+import * as Y from "yjs";
+import type { MayaspaceAuth } from "../auth/mayaspace-auth";
+
+// When the server can't be reached, bind on the IndexedDB snapshot this long
+// after it replays rather than blocking collaboration until a socket appears.
+const OFFLINE_BIND_GRACE_MS = 2500;
+
+export interface ProviderHandle {
+	doc: Y.Doc;
+	awareness: any;
+	destroy(): void;
+	/**
+	 * Resolves once the provider's initial sync settles: the Hocuspocus server
+	 * sync when online, or the IndexedDB snapshot (after a short grace) when the
+	 * server is unreachable. The editor binding waits on this so it never seeds
+	 * an empty ytext from the editor body and doubles the document.
+	 */
+	whenSynced: Promise<void>;
+}
+
+export type ProviderStatus = "connecting" | "connected" | "disconnected";
+
+export interface ProviderFactoryArgs {
+	url: string;
+	name: string;
+	token: string;
+	onStatus?: (s: ProviderStatus) => void;
+	onAuthFailure?: () => void;
+}
+
+export type ProviderFactory = (args: ProviderFactoryArgs) => ProviderHandle;
+
+interface OpenEntry {
+	orgId: string;
+	fileId: string;
+	handle: ProviderHandle;
+	refCount: number;
+}
+
+type PermissionLostListener = (info: { orgId: string; fileId: string }) => void;
+type StatusListener = (info: { orgId: string; fileId: string; status: ProviderStatus }) => void;
+
+export class MayaspaceSync {
+	private entries = new Map<string, OpenEntry>();
+	private permissionLostListeners: PermissionLostListener[] = [];
+	private statusListeners: StatusListener[] = [];
+
+	constructor(
+		private wsUrl: string,
+		private auth: MayaspaceAuth,
+		private factory: ProviderFactory,
+	) {}
+
+	async openDoc(orgId: string, fileId: string): Promise<ProviderHandle> {
+		const key = entryKey(orgId, fileId);
+		const existing = this.entries.get(key);
+		if (existing) {
+			existing.refCount += 1;
+			return existing.handle;
+		}
+
+		const token = await this.auth.getValidAccessToken();
+		const handle = this.factory({
+			url: this.wsUrl,
+			name: docName(orgId, fileId),
+			token,
+			onStatus: (status) => {
+				for (const l of this.statusListeners) l({ orgId, fileId, status });
+			},
+			onAuthFailure: () => {
+				this.dropEntry(key);
+				for (const l of this.permissionLostListeners) l({ orgId, fileId });
+			},
+		});
+
+		this.entries.set(key, { orgId, fileId, handle, refCount: 1 });
+		console.log(`[mayaspace] openDoc → ${docName(orgId, fileId)} via ${this.wsUrl}`);
+		return handle;
+	}
+
+	async closeDoc(orgId: string, fileId: string): Promise<void> {
+		const key = entryKey(orgId, fileId);
+		const entry = this.entries.get(key);
+		if (!entry) return;
+		entry.refCount -= 1;
+		if (entry.refCount > 0) return;
+		entry.handle.destroy();
+		this.entries.delete(key);
+	}
+
+	async closeAll(): Promise<void> {
+		for (const entry of Array.from(this.entries.values())) {
+			entry.handle.destroy();
+		}
+		this.entries.clear();
+	}
+
+	isOpen(orgId: string, fileId: string): boolean {
+		return this.entries.has(entryKey(orgId, fileId));
+	}
+
+	onPermissionLost(listener: PermissionLostListener): () => void {
+		this.permissionLostListeners.push(listener);
+		return () => {
+			const i = this.permissionLostListeners.indexOf(listener);
+			if (i >= 0) this.permissionLostListeners.splice(i, 1);
+		};
+	}
+
+	onStatus(listener: StatusListener): () => void {
+		this.statusListeners.push(listener);
+		return () => {
+			const i = this.statusListeners.indexOf(listener);
+			if (i >= 0) this.statusListeners.splice(i, 1);
+		};
+	}
+
+	private dropEntry(key: string): void {
+		const entry = this.entries.get(key);
+		if (!entry) return;
+		try { entry.handle.destroy(); } catch { /* already destroyed */ }
+		this.entries.delete(key);
+	}
+}
+
+function docName(orgId: string, fileId: string): string {
+	return `org:${orgId}:file:${fileId}`;
+}
+
+function entryKey(orgId: string, fileId: string): string {
+	return `${orgId}:${fileId}`;
+}
+
+/**
+ * Default factory that creates a real HocuspocusProvider backed by
+ * IndexedDB persistence.
+ *
+ * IndexeddbPersistence keeps the Y.Doc on disk per-document (keyed by the
+ * Hocuspocus doc name = `org:{orgId}:file:{fileId}`). That makes offline
+ * edits survive Obsidian restarts and plugin reloads: when the plugin
+ * loads again, the same doc name re-opens its IndexedDB store, replays
+ * the saved updates into the new Y.Doc, and once the WebSocket reconnects
+ * Hocuspocus performs a normal CRDT sync — local and remote changes
+ * merge deterministically without overwriting either side.
+ *
+ * Without this, the previous flow was: offline edit → ytext in memory →
+ * Obsidian/plugin restart → in-memory ytext gone → reconnect → ytext seeded
+ * from the server's old state → reconcile to vault.md wipes the user's
+ * offline edits. With IndexedDB the ytext arrives at reconcile time
+ * already containing the user's offline changes.
+ */
+export function defaultHocuspocusFactory(): ProviderFactory {
+	// eslint-disable-next-line @typescript-eslint/no-var-requires
+	const { HocuspocusProvider } = require("@hocuspocus/provider");
+	// eslint-disable-next-line @typescript-eslint/no-var-requires
+	const { IndexeddbPersistence } = require("y-indexeddb");
+
+	return ({ url, name, token, onStatus, onAuthFailure }) => {
+		const provider = new HocuspocusProvider({
+			url,
+			name,
+			token,
+			onStatus: (data: { status: ProviderStatus }) => onStatus?.(data.status),
+			onAuthenticationFailed: () => onAuthFailure?.(),
+		});
+		// Same doc name → same IndexedDB store. Survives Obsidian quit /
+		// plugin reload / device sleep, then CRDT-merges with the server on
+		// the next WebSocket sync.
+		const persistence = new IndexeddbPersistence(name, provider.document);
+
+		// Settle once the doc's content is the real merged truth, so the editor
+		// binding never seeds an empty ytext from the editor body (which doubles
+		// the document on the next sync). Online: the Hocuspocus `synced` event.
+		// Offline / unreachable server: fall back to the IndexedDB snapshot after
+		// a short grace, so editing isn't blocked forever when there's no socket.
+		const whenSynced = new Promise<void>((resolve) => {
+			let settled = false;
+			const settle = () => { if (!settled) { settled = true; resolve(); } };
+			if (provider.synced) { settle(); return; }
+			provider.on("synced", settle);
+			persistence.on("synced", () => {
+				console.log("[mayaspace] IndexedDB synced", name, "ytext.length=", provider.document.getText("content").length);
+				setTimeout(settle, OFFLINE_BIND_GRACE_MS);
+			});
+		});
+
+		return {
+			doc: provider.document,
+			awareness: provider.awareness,
+			whenSynced,
+			destroy: () => {
+				try { persistence.destroy(); } catch { /* already gone */ }
+				provider.destroy();
+			},
+		};
+	};
+}

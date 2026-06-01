@@ -1,0 +1,62 @@
+/* MayaSpace — Obsidian plugin styles */
+
+/* Org-mapped file/folder badge in the file explorer */
+.mayaspace-org-file .nav-file-title-content::before,
+.mayaspace-org-file .nav-folder-title-content::before {
+	content: "↖ ";
+	color: var(--interactive-accent);
+	font-weight: 600;
+	font-size: 0.85em;
+	margin-right: 2px;
+}
+
+.mayaspace-org-file {
+	color: var(--text-normal);
+}
+
+/* Live-collab connection status */
+.mayaspace-status-syncing .nav-file-title-content::after {
+	content: " …";
+	color: var(--text-muted);
+	font-size: 0.9em;
+}
+
+.mayaspace-status-connected .nav-file-title-content::after {
+	content: " ●";
+	color: var(--color-green);
+	font-size: 0.7em;
+}
+
+.mayaspace-status-offline .nav-file-title-content::after {
+	content: " ○";
+	color: var(--text-muted);
+	font-size: 0.7em;
+}
+
+.mayaspace-status-conflict .nav-file-title-content::after {
+	content: " !";
+	color: var(--color-red);
+	font-weight: bold;
+}
+
+/* Subtle background tint so the org-file rows are visually distinct */
+.mayaspace-org-file {
+	background: linear-gradient(to right, transparent, var(--background-modifier-hover) 96%);
+}
+
+/* Device flow modal */
+.mayaspace-device-flow-waiting {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	text-align: center;
+}
+
+/* Remote cursor label (y-codemirror.next adds .cm-ySelectionInfo) */
+.cm-ySelectionInfo {
+	opacity: 0.7;
+	border-radius: 3px;
+	padding: 0 2px;
+}
+.cm-ySelectionInfo:hover {
+	opacity: 1;
+}

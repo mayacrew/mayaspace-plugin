@@ -1,0 +1,11 @@
+{
+	"id": "mayaspace-plugin",
+	"name": "MayaSpace (new)",
+	"version": "0.1.0",
+	"minAppVersion": "1.4.0",
+	"description": "Real-time collaborative editing with a MayaSpace backend (OAuth Device Flow + Hocuspocus).",
+	"author": "",
+	"authorUrl": "",
+	"fundingUrl": "",
+	"isDesktopOnly": false
+}
