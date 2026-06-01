@@ -40,6 +40,8 @@ import { makePeerIdentity } from "./ui/peer-identity";
 import { ExplorerDecorator, type SyncStatus } from "./ui/explorer-decorator";
 
 import { parseMayaspacePath, sanitizeFolderName } from "./lib/path";
+import { READ, UPDATE, CREATE, DELETE, can } from "./lib/permissions";
+import { checkCreate, checkUpdate, checkDelete, checkMove } from "./permissions/permission-guard";
 import { EditorView } from "@codemirror/view";
 
 export default class MayaspacePlugin extends Plugin {
@@ -116,6 +118,11 @@ export default class MayaspacePlugin extends Plugin {
 				if (other === path) continue;
 				await this.liveCollab.detach(other).catch(() => undefined);
 				delete this.fileStatuses[other];
+			}
+			const permsActive = this.settings.orgPermissions[mapping.orgId] ?? 0;
+			if (!can(permsActive, UPDATE)) {
+				console.log("[mayaspace] skip live-collab attach: no UPDATE perm", path);
+				return;
 			}
 			await this.liveCollab.attach(path, mapping).catch((e) =>
 				console.warn("[mayaspace] attach on layout-ready failed", path, e),
@@ -284,6 +291,11 @@ export default class MayaspacePlugin extends Plugin {
 					// response to the file change before we dispatch the new
 					// compartment.
 					await new Promise<void>((r) => requestAnimationFrame(() => r()));
+					const permsFileOpen = this.settings.orgPermissions[mapping.orgId] ?? 0;
+					if (!can(permsFileOpen, UPDATE)) {
+						console.log("[mayaspace] skip live-collab attach: no UPDATE perm", file.path);
+						return;
+					}
 					await this.liveCollab.attach(file.path, mapping).catch((e) =>
 						console.warn("[mayaspace] attach failed", file.path, e),
 					);
@@ -460,10 +472,31 @@ export default class MayaspacePlugin extends Plugin {
 					this.settings.orgMappings[folderName] = orgId;
 				},
 				onOrgPermissions: async (perms) => {
+					const prev = { ...this.settings.orgPermissions };
 					this.settings.orgPermissions = perms;
 					// saveSettings happens at the end of syncTrees, but make it explicit here
 					// so the cache is durable even if a later step in syncTrees throws.
 					await this.saveSettings();
+
+					for (const orgId of new Set([...Object.keys(prev), ...Object.keys(perms)])) {
+						const before = prev[orgId] ?? 0;
+						const after = perms[orgId] ?? 0;
+						const lostRead = !!(before & READ) && !(after & READ);
+						const lostUpdate = !!(before & UPDATE) && !(after & UPDATE);
+						if (!lostRead && !lostUpdate) continue;
+
+						for (const [path, m] of Object.entries(this.settings.fileMappings)) {
+							if (m.orgId !== orgId) continue;
+							if (this.liveCollab.activePaths().includes(path)) {
+								await this.liveCollab.detach(path).catch(() => undefined);
+							}
+							if (lostRead) {
+								this.stopPrefetch(path);
+							}
+						}
+						if (lostRead) new Notice("MayaSpace: 읽기 권한이 회수되었습니다.");
+						else if (lostUpdate) new Notice("MayaSpace: 편집 권한이 회수되었습니다.");
+					}
 				},
 			},
 		);
@@ -739,6 +772,12 @@ export default class MayaspacePlugin extends Plugin {
 		if (!parsed) return;
 		const orgId = this.settings.orgMappings[parsed.orgName];
 		if (!orgId) return;
+		const perms = this.settings.orgPermissions[orgId] ?? 0;
+		const guard = checkCreate(perms);
+		if (!guard.allowed) {
+			new Notice(guard.message!);
+			return;
+		}
 		this.inflightCreates.add(path);
 		try {
 			// If the file was created with body content (Claude CLI, Finder
@@ -800,6 +839,12 @@ export default class MayaspacePlugin extends Plugin {
 		if (this.selfWrites.has(path)) return;
 		const mapping = this.mappings.getFile(path);
 		if (!mapping) return; // not a mayaspace-tracked file
+		const perms = this.settings.orgPermissions[mapping.orgId] ?? 0;
+		const g = checkUpdate(perms);
+		if (!g.allowed) {
+			new Notice(g.message!);
+			return;
+		}
 		// While a live editor session is open, yCollab/Hocuspocus owns the
 		// content. Any external write here would race with ytext updates.
 		// Obsidian rarely fires modify for the active editor's own keystrokes
@@ -853,23 +898,26 @@ export default class MayaspacePlugin extends Plugin {
 		// 밖 → 안: 사실상 신규 진입. vault.on('create')는 발화하지 않으므로
 		// handleVaultCreate에 위임해 서버 등록 + 본문 업로드 + prefetch까지 한 번에 처리.
 		if (!parsedOld && parsedNew) {
+			const orgId = this.settings.orgMappings[parsedNew.orgName];
+			const perms = orgId ? (this.settings.orgPermissions[orgId] ?? 0) : 0;
+			const g = checkCreate(perms);
+			if (!g.allowed) { new Notice(g.message!); return; }
 			await this.handleVaultCreate(newPath);
 			return;
 		}
 
-		// 안 → 밖: 서버 데이터 보호 차원에서 거부 토스트. 사용자가 명시적으로
-		// 삭제하려면 공유 폴더 안에서 삭제 명령을 쓰도록 안내. 로컬 매핑은
-		// stale 상태이므로 정리한다. (드래그를 되돌리진 않는다 — 사용자가 직접
-		// 다시 옮기면 위 "밖 → 안" 분기로 재진입.)
+		// 안 → 밖: 서버 파일은 보존하고 매핑도 유지한다. 삭제 권한이 없으면
+		// 그 사실을 알리고, 있어도 공유 폴더 밖 이동은 지원하지 않는다고 안내.
+		// (spec 6.4: mapping preserved so user can recover by moving back in.)
 		if (parsedOld && !parsedNew) {
-			new Notice(
-				"MayaSpace: 공유 폴더 밖으로 이동은 지원하지 않습니다. 삭제하려면 폴더 안에서 삭제 명령을 사용하세요.",
-			);
-			if (this.settings.fileMappings[oldPath]) {
-				delete this.settings.fileMappings[oldPath];
-				await this.saveSettings();
-				this.decorator.refresh();
+			const orgId = this.settings.orgMappings[parsedOld.orgName];
+			const perms = orgId ? (this.settings.orgPermissions[orgId] ?? 0) : 0;
+			if (!can(perms, DELETE)) {
+				new Notice("MayaSpace: 삭제 권한이 없어 로컬만 이동되고 서버 파일은 그대로 유지됩니다.");
+			} else {
+				new Notice("MayaSpace: 공유 폴더 밖 이동은 지원하지 않습니다. 삭제하려면 폴더 안에서 삭제 명령을 사용하세요.");
 			}
+			// Mapping preserved — server file remains intact regardless of permission.
 			return;
 		}
 
@@ -880,6 +928,10 @@ export default class MayaspacePlugin extends Plugin {
 			new Notice("MayaSpace: cross-org moves aren't supported yet.");
 			return;
 		}
+		const orgIdSame = this.settings.orgMappings[parsedNew!.orgName];
+		const permsSame = orgIdSame ? (this.settings.orgPermissions[orgIdSame] ?? 0) : 0;
+		const gMove = checkMove(permsSame);
+		if (!gMove.allowed) { new Notice(gMove.message!); return; }
 		try {
 			await this.api.moveFile(mapping.orgId, mapping.fileId, parsedNew!.relPath);
 			delete this.settings.fileMappings[oldPath];
@@ -894,6 +946,13 @@ export default class MayaspacePlugin extends Plugin {
 	private async handleVaultDelete(path: string): Promise<void> {
 		const mapping = this.settings.fileMappings[path];
 		if (!mapping) return;
+		const perms = this.settings.orgPermissions[mapping.orgId] ?? 0;
+		const g = checkDelete(perms);
+		if (!g.allowed) {
+			new Notice(g.message + " 로컬은 삭제됐지만 서버 파일은 보존됩니다.");
+			// Mapping preserved — if user regains DELETE later, the server still has the file.
+			return;
+		}
 		this.stopPrefetch(path);
 		try {
 			await this.api.deleteFile(mapping.orgId, mapping.fileId);
