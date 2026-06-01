@@ -838,16 +838,44 @@ export default class MayaspacePlugin extends Plugin {
 	}
 
 	private async handleVaultRename(oldPath: string, newPath: string): Promise<void> {
-		const mapping = this.settings.fileMappings[oldPath];
-		if (!mapping) return;
 		const parsedOld = parseMayaspacePath(oldPath, this.settings.mayaspaceRoot);
 		const parsedNew = parseMayaspacePath(newPath, this.settings.mayaspaceRoot);
-		if (!parsedNew || !parsedOld || parsedOld.orgName !== parsedNew.orgName) {
+
+		// 둘 다 mayaspace 밖이면 무관.
+		if (!parsedOld && !parsedNew) return;
+
+		// 밖 → 안: 사실상 신규 진입. vault.on('create')는 발화하지 않으므로
+		// handleVaultCreate에 위임해 서버 등록 + 본문 업로드 + prefetch까지 한 번에 처리.
+		if (!parsedOld && parsedNew) {
+			await this.handleVaultCreate(newPath);
+			return;
+		}
+
+		// 안 → 밖: 서버 데이터 보호 차원에서 거부 토스트. 사용자가 명시적으로
+		// 삭제하려면 공유 폴더 안에서 삭제 명령을 쓰도록 안내. 로컬 매핑은
+		// stale 상태이므로 정리한다. (드래그를 되돌리진 않는다 — 사용자가 직접
+		// 다시 옮기면 위 "밖 → 안" 분기로 재진입.)
+		if (parsedOld && !parsedNew) {
+			new Notice(
+				"MayaSpace: 공유 폴더 밖으로 이동은 지원하지 않습니다. 삭제하려면 폴더 안에서 삭제 명령을 사용하세요.",
+			);
+			if (this.settings.fileMappings[oldPath]) {
+				delete this.settings.fileMappings[oldPath];
+				await this.saveSettings();
+				this.decorator.refresh();
+			}
+			return;
+		}
+
+		// 둘 다 mayaspace 안 — 기존 move 로직.
+		const mapping = this.settings.fileMappings[oldPath];
+		if (!mapping) return;
+		if (parsedOld!.orgName !== parsedNew!.orgName) {
 			new Notice("MayaSpace: cross-org moves aren't supported yet.");
 			return;
 		}
 		try {
-			await this.api.moveFile(mapping.orgId, mapping.fileId, parsedNew.relPath);
+			await this.api.moveFile(mapping.orgId, mapping.fileId, parsedNew!.relPath);
 			delete this.settings.fileMappings[oldPath];
 			this.settings.fileMappings[newPath] = mapping;
 			await this.saveSettings();
