@@ -499,13 +499,16 @@ export default class MayaspacePlugin extends Plugin {
 	private async hydrateFile(path: string, mapping: FileMapping): Promise<void> {
 		if (this.liveCollab.activePaths().includes(path)) return;
 		try {
-			const { content } = await this.api.readFile(mapping.orgId, mapping.fileId);
 			const file = this.app.vault.getAbstractFileByPath(path);
-			if (file instanceof TFile) {
-				const current = await this.app.vault.read(file);
-				if (current === content) return; // already up-to-date
-				await this.safeModify(file, content);
-			}
+			if (!(file instanceof TFile)) return;
+			const current = await this.app.vault.read(file);
+			// vault에 사용자 편집(또는 이전 세션의 본문)이 있으면 덮어쓰지 않는다.
+			// 사용자가 오프라인으로 작성한 내용이 옛 서버 본문에 의해 사라지는 케이스를 막는다.
+			// CRDT 머지는 yCollab attach 시(즉 사용자가 파일을 열 때) 일어난다.
+			if (current.length > 0) return;
+			const { content } = await this.api.readFile(mapping.orgId, mapping.fileId);
+			if (current === content) return; // already up-to-date (both empty)
+			await this.safeModify(file, content);
 		} catch (e) {
 			console.warn("[mayaspace] hydrate failed", path, e);
 		}
@@ -548,6 +551,10 @@ export default class MayaspacePlugin extends Plugin {
 				try {
 					const current = await this.app.vault.read(file);
 					if (current === content) return;
+					// vault에 사용자 편집(혹은 stale 본문)이 있고 ytext와 다르면 그대로 둔다.
+					// 옛 IndexedDB ytext가 사용자 편집을 덮어쓰는 race를 막는다.
+					// 사용자가 파일을 열면 yCollab attach 시 CRDT merge로 합쳐진다.
+					if (current.length > 0) return;
 					await this.safeModify(file, content);
 				} catch (e) {
 					console.warn("[mayaspace] prefetch flush failed", path, e);
@@ -632,19 +639,32 @@ export default class MayaspacePlugin extends Plugin {
 			const after = perms[orgId] ?? 0;
 			const lostRead = !!(before & READ) && !(after & READ);
 			const lostUpdate = !!(before & UPDATE) && !(after & UPDATE);
-			if (!lostRead && !lostUpdate) continue;
+			const gainedRead = !(before & READ) && !!(after & READ);
 
-			for (const [path, m] of Object.entries(this.settings.fileMappings)) {
-				if (m.orgId !== orgId) continue;
-				if (this.liveCollab.activePaths().includes(path)) {
-					await this.liveCollab.detach(path).catch(() => undefined);
+			if (lostRead || lostUpdate) {
+				for (const [path, m] of Object.entries(this.settings.fileMappings)) {
+					if (m.orgId !== orgId) continue;
+					if (this.liveCollab.activePaths().includes(path)) {
+						await this.liveCollab.detach(path).catch(() => undefined);
+					}
+					if (lostRead) {
+						this.stopPrefetch(path);
+					}
 				}
-				if (lostRead) {
-					this.stopPrefetch(path);
+				if (lostRead) new Notice("MayaSpace: 읽기 권한이 회수되었습니다.");
+				else if (lostUpdate) new Notice("MayaSpace: 편집 권한이 회수되었습니다.");
+			}
+
+			// 권한 회복 시 prefetch 재시작 — 회수 사이클로 prefetch가 죽었으면
+			// handleVaultModify가 새 단발성 세션을 띄우게 되어 IndexedDB
+			// flush race가 생긴다. 미리 살려두면 그 race가 사라진다.
+			if (gainedRead) {
+				for (const [path, m] of Object.entries(this.settings.fileMappings)) {
+					if (m.orgId !== orgId) continue;
+					if (this.prefetches.has(path)) continue;
+					void this.startPrefetch(path, m);
 				}
 			}
-			if (lostRead) new Notice("MayaSpace: 읽기 권한이 회수되었습니다.");
-			else if (lostUpdate) new Notice("MayaSpace: 편집 권한이 회수되었습니다.");
 		}
 	}
 
