@@ -21,7 +21,7 @@ export interface Org {
 	effective_permissions?: number;
 }
 export interface OrgMember { user_id: string; role: string; }
-export interface FileMeta { id: string; path: string; etag?: string; mtime?: string; size?: number; }
+export interface FileMeta { id: string; path: string; etag?: string; mtime?: string; size?: number; effective_permissions?: number; }
 export interface UserInfo { id: string; email: string; deviceId?: string; }
 
 export class EtagMismatchError extends Error {

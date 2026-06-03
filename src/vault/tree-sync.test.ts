@@ -174,6 +174,21 @@ describe("syncOrgTrees", () => {
 	});
 });
 
+describe("syncOrgTrees — onFilePermissions", () => {
+	it("tree 응답의 effective_permissions를 onFilePermissions로 전달한다", async () => {
+		const api = {
+			listOrgs: async () => [{ id: "o1", name: "Acme", effective_permissions: 0 }],
+			getTree: async () => [{ id: "f1", path: "taeho/n.md", effective_permissions: 15 }],
+		};
+		const seen: Record<string, number> = {};
+		await syncOrgTrees(makeVault().vault, api as any, {
+			mayaspaceRoot: "MayaSpace",
+			onFilePermissions: (fileId, perms) => { seen[fileId] = perms; },
+		});
+		expect(seen.f1).toBe(15);
+	});
+});
+
 describe("syncOrgTrees — onOrgPermissions", () => {
 	test("passes effective_permissions per org to the callback", async () => {
 		const onOrgPermissions = jest.fn();

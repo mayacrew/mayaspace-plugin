@@ -472,6 +472,7 @@ export default class MayaspacePlugin extends Plugin {
 					this.settings.orgMappings[folderName] = orgId;
 				},
 				onOrgPermissions: (perms) => this.applyOrgPermissions(perms),
+				onFilePermissions: (fileId, perms) => { this.settings.filePermissions[fileId] = perms; },
 			},
 		);
 		this.settings.orgMappings = result.orgs;
@@ -618,6 +619,7 @@ export default class MayaspacePlugin extends Plugin {
 				// Same diff+detach logic as syncTrees — admin's permission changes
 				// must reach the plugin via the periodic poll, not just on next login.
 				onOrgPermissions: (perms) => this.applyOrgPermissions(perms),
+				onFilePermissions: (fileId, perms) => { this.settings.filePermissions[fileId] = perms; },
 				onError: (e) => console.warn("[mayaspace] poller", e),
 			},
 			this.settings.treePollIntervalSec * 1000,

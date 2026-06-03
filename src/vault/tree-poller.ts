@@ -37,6 +37,8 @@ export interface PollerHooks {
 	 * the next explicit syncTrees (logout/relogin or manual "Sync now").
 	 */
 	onOrgPermissions?(perms: Record<string, number>): Promise<void> | void;
+	/** 파일별 effective_permissions 전달. 캐시 갱신용. */
+	onFilePermissions?(fileId: string, perms: number): void;
 	onError?(e: unknown): void;
 }
 
@@ -93,6 +95,7 @@ export class TreePoller {
 		for (const file of tree) {
 			const fullPath = `${orgFolder}/${file.path}`;
 			serverPaths.add(fullPath);
+			this.hooks.onFilePermissions?.(file.id, file.effective_permissions ?? 0);
 			const known = this.hooks.getKnownFiles()[fullPath];
 			if (known && known.fileId === file.id) continue;
 

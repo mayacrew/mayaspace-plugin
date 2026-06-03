@@ -47,6 +47,8 @@ export interface SyncOptions {
 	 * (no access — safest default).
 	 */
 	onOrgPermissions?: (perms: Record<string, number>) => void | Promise<void>;
+	/** 파일별 effective_permissions 전달. 캐시 갱신용. */
+	onFilePermissions?: (fileId: string, perms: number) => void;
 }
 
 export interface SyncResult {
@@ -87,6 +89,7 @@ export async function syncOrgTrees(
 			const mapping = { orgId: org.id, fileId: file.id };
 			result.files[fullPath] = mapping;
 			opts.onFileMapped?.(fullPath, mapping);
+			opts.onFilePermissions?.(file.id, file.effective_permissions ?? 0);
 			await ensureParentFolders(vault, fullPath);
 			await ensureFile(vault, fullPath);
 		}

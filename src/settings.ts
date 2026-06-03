@@ -17,6 +17,8 @@ export interface MayaspaceSettings {
 	fileMappings: Record<string, FileMapping>;
 	/** orgId → effective permissions bits (R|U|C|D) at root path. Refreshed via listOrgs response. */
 	orgPermissions: Record<string, number>;
+	/** fileId → effective_permissions (경로별 권한 캐시). 트리 sync/poll로 갱신. */
+	filePermissions: Record<string, number>;
 }
 
 export const DEFAULT_SETTINGS: MayaspaceSettings = {
@@ -30,6 +32,7 @@ export const DEFAULT_SETTINGS: MayaspaceSettings = {
 	orgMappings: {},
 	fileMappings: {},
 	orgPermissions: {},
+	filePermissions: {},
 };
 
 export class MayaspaceSettingTab extends PluginSettingTab {
