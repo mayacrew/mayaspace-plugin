@@ -119,7 +119,7 @@ export default class MayaspacePlugin extends Plugin {
 				await this.liveCollab.detach(other).catch(() => undefined);
 				delete this.fileStatuses[other];
 			}
-			const permsActive = this.settings.orgPermissions[mapping.orgId] ?? 0;
+			const permsActive = this.permsForFileId(mapping.orgId, mapping.fileId);
 			if (!can(permsActive, UPDATE)) {
 				console.log("[mayaspace] skip live-collab attach: no UPDATE perm", path);
 				return;
@@ -291,7 +291,7 @@ export default class MayaspacePlugin extends Plugin {
 					// response to the file change before we dispatch the new
 					// compartment.
 					await new Promise<void>((r) => requestAnimationFrame(() => r()));
-					const permsFileOpen = this.settings.orgPermissions[mapping.orgId] ?? 0;
+					const permsFileOpen = this.permsForFileId(mapping.orgId, mapping.fileId);
 					if (!can(permsFileOpen, UPDATE)) {
 						console.log("[mayaspace] skip live-collab attach: no UPDATE perm", file.path);
 						return;
@@ -801,7 +801,7 @@ export default class MayaspacePlugin extends Plugin {
 		if (!parsed) return;
 		const orgId = this.settings.orgMappings[parsed.orgName];
 		if (!orgId) return;
-		const perms = this.settings.orgPermissions[orgId] ?? 0;
+		const perms = this.permsForNewPath(orgId, path);
 		const guard = checkCreate(perms);
 		if (!guard.allowed) {
 			new Notice(guard.message!);
@@ -868,7 +868,7 @@ export default class MayaspacePlugin extends Plugin {
 		if (this.selfWrites.has(path)) return;
 		const mapping = this.mappings.getFile(path);
 		if (!mapping) return; // not a mayaspace-tracked file
-		const perms = this.settings.orgPermissions[mapping.orgId] ?? 0;
+		const perms = this.permsForFileId(mapping.orgId, mapping.fileId);
 		const g = checkUpdate(perms);
 		if (!g.allowed) {
 			new Notice(g.message!);
@@ -928,7 +928,7 @@ export default class MayaspacePlugin extends Plugin {
 		// handleVaultCreate에 위임해 서버 등록 + 본문 업로드 + prefetch까지 한 번에 처리.
 		if (!parsedOld && parsedNew) {
 			const orgId = this.settings.orgMappings[parsedNew.orgName];
-			const perms = orgId ? (this.settings.orgPermissions[orgId] ?? 0) : 0;
+			const perms = orgId ? this.permsForNewPath(orgId, newPath) : 0;
 			const g = checkCreate(perms);
 			if (!g.allowed) { new Notice(g.message!); return; }
 			await this.handleVaultCreate(newPath);
@@ -940,7 +940,8 @@ export default class MayaspacePlugin extends Plugin {
 		// (spec 6.4: mapping preserved so user can recover by moving back in.)
 		if (parsedOld && !parsedNew) {
 			const orgId = this.settings.orgMappings[parsedOld.orgName];
-			const perms = orgId ? (this.settings.orgPermissions[orgId] ?? 0) : 0;
+			const oldMapping = this.settings.fileMappings[oldPath];
+			const perms = oldMapping ? this.permsForFileId(orgId, oldMapping.fileId) : (this.settings.orgPermissions[orgId] ?? 0);
 			if (!can(perms, DELETE)) {
 				new Notice("MayaSpace: 삭제 권한이 없어 로컬만 이동되고 서버 파일은 그대로 유지됩니다.");
 			} else {
@@ -958,7 +959,7 @@ export default class MayaspacePlugin extends Plugin {
 			return;
 		}
 		const orgIdSame = this.settings.orgMappings[parsedNew!.orgName];
-		const permsSame = orgIdSame ? (this.settings.orgPermissions[orgIdSame] ?? 0) : 0;
+		const permsSame = orgIdSame ? this.permsForNewPath(orgIdSame, newPath) : 0;
 		const gMove = checkMove(permsSame);
 		if (!gMove.allowed) { new Notice(gMove.message!); return; }
 		try {
@@ -975,7 +976,7 @@ export default class MayaspacePlugin extends Plugin {
 	private async handleVaultDelete(path: string): Promise<void> {
 		const mapping = this.settings.fileMappings[path];
 		if (!mapping) return;
-		const perms = this.settings.orgPermissions[mapping.orgId] ?? 0;
+		const perms = this.permsForFileId(mapping.orgId, mapping.fileId);
 		const g = checkDelete(perms);
 		if (!g.allowed) {
 			new Notice(g.message + " 로컬은 삭제됐지만 서버 파일은 보존됩니다.");
@@ -1038,6 +1039,33 @@ export default class MayaspacePlugin extends Plugin {
 			await this.liveCollab.detach(activePath);
 			delete this.fileStatuses[activePath];
 		}
+	}
+
+	/** 기존 파일: filePermissions[fileId] → 없으면 org 루트 폴백. */
+	private permsForFileId(orgId: string, fileId: string): number {
+		return this.settings.filePermissions[fileId] ?? this.settings.orgPermissions[orgId] ?? 0;
+	}
+
+	/** 신규 파일(아직 fileId 없음): 같은 폴더 형제 파일의 perms로 추론, 없으면 org 루트 폴백. */
+	private permsForNewPath(orgId: string, fullPath: string): number {
+		const parent = fullPath.slice(0, fullPath.lastIndexOf("/"));
+		for (const [p, m] of Object.entries(this.settings.fileMappings)) {
+			if (m.orgId !== orgId) continue;
+			if (p.slice(0, p.lastIndexOf("/")) !== parent) continue;
+			const sib = this.settings.filePermissions[m.fileId];
+			if (sib !== undefined) return sib;
+		}
+		return this.settings.orgPermissions[orgId] ?? 0;
+	}
+
+	/** 그룹 C(사이드바)용 공개 헬퍼: relPath 기준 유효 권한. 매핑 있으면 fileId, 없으면 폴더 추론. */
+	getEffectivePermsForPath(orgId: string, relPath: string): number {
+		const folder = this.findOrgFolder(orgId);
+		if (!folder) return this.settings.orgPermissions[orgId] ?? 0;
+		const fullPath = `${this.settings.mayaspaceRoot}/${folder}/${relPath}`;
+		const m = this.settings.fileMappings[fullPath];
+		if (m) return this.permsForFileId(orgId, m.fileId);
+		return this.permsForNewPath(orgId, fullPath);
 	}
 
 	private findOrgFolder(orgId: string): string | null {
