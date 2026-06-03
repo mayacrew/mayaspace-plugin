@@ -12,6 +12,25 @@
 import type { MayaspaceAuth } from "../auth/mayaspace-auth";
 import type { Fetcher, HttpRequest, HttpResponse } from "./mayaspace-http";
 
+export interface FileHistoryEntry {
+	id: string;
+	fileId: string;
+	orgId: string;
+	userId: string | null;
+	deviceId: string | null;
+	action: string;
+	path: string | null;
+	meta: Record<string, unknown> | null;
+	createdAt: string;
+}
+
+export interface FileAccessMember {
+	userId: string;
+	email: string;
+	handle: string;
+	effectivePermissions: number;
+}
+
 export interface Org {
 	id: string;
 	name: string;
@@ -84,6 +103,41 @@ export class MayaspaceApi {
 		await this.request<void>("POST", `/v1/orgs/${enc(orgId)}/files/${enc(fileId)}/move`, {
 			body: { new_path: newPath },
 		});
+	}
+
+	// ---- Collab / Presence ----
+	async getFilePresence(orgId: string, fileId: string): Promise<{ orgId: string; fileId: string; userIds: string[] }> {
+		return this.request<{ orgId: string; fileId: string; userIds: string[] }>(
+			"GET",
+			`/v1/orgs/${enc(orgId)}/files/${enc(fileId)}/presence`,
+		);
+	}
+
+	// ---- File history ----
+	async getFileHistory(
+		orgId: string,
+		fileId: string,
+		opts?: { limit?: number; cursor?: string },
+	): Promise<{ entries: FileHistoryEntry[]; nextCursor?: string }> {
+		const params = new URLSearchParams();
+		if (opts?.limit) params.set("limit", String(opts.limit));
+		if (opts?.cursor) params.set("cursor", opts.cursor);
+		const qs = params.toString();
+		return this.request<{ entries: FileHistoryEntry[]; nextCursor?: string }>(
+			"GET",
+			`/v1/orgs/${enc(orgId)}/files/${enc(fileId)}/history${qs ? `?${qs}` : ""}`,
+		);
+	}
+
+	// ---- File access summary ----
+	async getFileAccessSummary(
+		orgId: string,
+		fileId: string,
+	): Promise<{ members: FileAccessMember[] }> {
+		return this.request<{ members: FileAccessMember[] }>(
+			"GET",
+			`/v1/orgs/${enc(orgId)}/files/${enc(fileId)}/access-summary`,
+		);
 	}
 
 	// ---- Capabilities ----

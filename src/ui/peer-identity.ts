@@ -12,8 +12,12 @@ export interface PeerIdentity {
 	colorLight: string;
 }
 
-export function makePeerIdentity(displayName: string | null, email: string | null): PeerIdentity {
-	const name = pickName(displayName, email);
+export function makePeerIdentity(
+	displayName: string | null,
+	email: string | null,
+	handle?: string | null,
+): PeerIdentity {
+	const name = pickName(displayName, email, handle);
 	const hue = hueFromString(name);
 	return {
 		name,
@@ -22,9 +26,12 @@ export function makePeerIdentity(displayName: string | null, email: string | nul
 	};
 }
 
-function pickName(displayName: string | null, email: string | null): string {
+// email-first: 검증된 서버 identity(email/handle)를 사용자 지정 displayName보다 우선한다.
+// displayName은 타인의 이름으로 설정될 수 있어 표시 신원 고정(C4) 목적으로 신뢰하지 않는다.
+function pickName(displayName: string | null, email: string | null, handle?: string | null): string {
+	if (email) return email;
+	if (handle && handle.trim()) return handle.trim();
 	if (displayName && displayName.trim()) return displayName.trim();
-	if (email) return email.split("@")[0];
 	return "Anonymous";
 }
 

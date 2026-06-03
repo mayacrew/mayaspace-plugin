@@ -38,6 +38,7 @@ import { MayaspaceEvents } from "./events/sse-subscriber";
 
 import { makePeerIdentity } from "./ui/peer-identity";
 import { ExplorerDecorator, type SyncStatus } from "./ui/explorer-decorator";
+import { CollabSidebarView, VIEW_TYPE_COLLAB, type CollabSidebarCallbacks } from "./ui/collab-sidebar";
 
 import { parseMayaspacePath, sanitizeFolderName } from "./lib/path";
 import { READ, UPDATE, CREATE, DELETE, can } from "./lib/permissions";
@@ -54,6 +55,7 @@ export default class MayaspacePlugin extends Plugin {
 	decorator!: ExplorerDecorator;
 
 	private events: MayaspaceEvents | null = null;
+	private collabSidebar: CollabSidebarView | null = null;
 	private treePoller: TreePoller | null = null;
 	private statusBarItem: HTMLElement | null = null;
 	private fileStatuses: Record<string, SyncStatus> = {};
@@ -76,6 +78,8 @@ export default class MayaspacePlugin extends Plugin {
 		this.rebuildBackendClients();
 		this.buildLiveCollab();
 		this.buildDecorator();
+
+		this.buildCollabSidebar();
 
 		this.settingTab = new MayaspaceSettingTab(this.app, this);
 		this.addSettingTab(this.settingTab);
@@ -221,6 +225,58 @@ export default class MayaspacePlugin extends Plugin {
 		});
 	}
 
+	private buildCollabSidebar(): void {
+		const callbacks: CollabSidebarCallbacks = {
+			getAccessSummary: async (orgId, fileId) => {
+				const result = await this.api.getFileAccessSummary(orgId, fileId);
+				return result.members;
+			},
+			getHistory: async (orgId, fileId) => {
+				const result = await this.api.getFileHistory(orgId, fileId);
+				return result.entries;
+			},
+			getPresence: async (orgId, fileId) => {
+				const result = await this.api.getFilePresence(orgId, fileId);
+				return result.userIds;
+			},
+			getMyEmail: () => this.settings.accountEmail,
+		};
+
+		this.registerView(VIEW_TYPE_COLLAB, (leaf) => {
+			this.collabSidebar = new CollabSidebarView(leaf, callbacks);
+			return this.collabSidebar;
+		});
+
+		this.addRibbonIcon("users", "MayaSpace 협업 사이드바", () => this.activateCollabSidebar());
+	}
+
+	private async activateCollabSidebar(): Promise<void> {
+		const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_COLLAB);
+		if (existing.length > 0) {
+			this.app.workspace.revealLeaf(existing[0]);
+			return;
+		}
+		const leaf = this.app.workspace.getRightLeaf(false);
+		if (!leaf) return;
+		await leaf.setViewState({ type: VIEW_TYPE_COLLAB, active: true });
+		this.app.workspace.revealLeaf(leaf);
+	}
+
+	/** 사이드바에 현재 파일 컨텍스트를 업데이트한다. main.ts의 file-open 핸들러가 호출. */
+	private updateSidebarContext(filePath: string | null): void {
+		if (!this.collabSidebar) return;
+		if (!filePath) {
+			this.collabSidebar.setFileContext(null);
+			return;
+		}
+		const mapping = this.mappings.getFile(filePath);
+		if (!mapping) {
+			this.collabSidebar.setFileContext(null);
+			return;
+		}
+		this.collabSidebar.setFileContext({ orgId: mapping.orgId, fileId: mapping.fileId, filePath });
+	}
+
 	// ---------- Commands ----------
 
 	private registerCommands(): void {
@@ -267,6 +323,8 @@ export default class MayaspacePlugin extends Plugin {
 			this.app.workspace.on("file-open", (file) => {
 				if (!file) return;
 				const mapping = file ? this.mappings.getFile(file.path) : null;
+				// 사이드바 컨텍스트는 즉시 갱신 — liveCollab attach보다 먼저.
+				this.updateSidebarContext(file.path);
 				// Defer to a macro task. queueMicrotask is too early: Obsidian
 				// fires file-open BEFORE it replaces the leaf's EditorState on
 				// in-leaf file switches, and the replacement happens in a
@@ -786,6 +844,11 @@ export default class MayaspacePlugin extends Plugin {
 						return;
 					}
 					await this.hydrateFile(localPath, { orgId: p.orgId, fileId: p.fileId });
+				},
+				onPresenceChanged: (p) => {
+					if (this.collabSidebar) {
+						this.collabSidebar.onPresenceChanged(p.orgId, p.fileId, p.userIds);
+					}
 				},
 				onError: (orgId, e) => console.warn("[mayaspace] SSE error", orgId, e),
 			},

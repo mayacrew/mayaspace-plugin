@@ -40,11 +40,18 @@ export interface FileUpdatedEvent {
 	deviceId: string | null;
 }
 
+export interface PresenceChangedEvent {
+	orgId: string;
+	fileId: string;
+	userIds: string[];
+}
+
 export interface EventsHandlers {
 	onCreated?: (p: FileCreatedEvent) => void | Promise<void>;
 	onDeleted?: (p: FileDeletedEvent) => void | Promise<void>;
 	onMoved?: (p: FileMovedEvent) => void | Promise<void>;
 	onUpdated?: (p: FileUpdatedEvent) => void | Promise<void>;
+	onPresenceChanged?: (p: PresenceChangedEvent) => void | Promise<void>;
 	onError?: (orgId: string, e: unknown) => void;
 }
 
@@ -74,6 +81,7 @@ export class MayaspaceEvents {
 		es.addEventListener("file.deleted", (e) => this.dispatch(orgId, e, "onDeleted"));
 		es.addEventListener("file.moved", (e) => this.dispatch(orgId, e, "onMoved"));
 		es.addEventListener("file.updated", (e) => this.dispatch(orgId, e, "onUpdated"));
+		es.addEventListener("presence.changed", (e) => this.dispatchPresence(orgId, e));
 		es.addEventListener("error", (e) => this.opts.handlers.onError?.(orgId, e));
 
 		this.sources.set(orgId, es);
@@ -104,5 +112,19 @@ export class MayaspaceEvents {
 		const cb = this.opts.handlers[key];
 		if (!cb) return;
 		Promise.resolve(cb(payload as never)).catch((err) => this.opts.handlers.onError?.(orgId, err));
+	}
+
+	private dispatchPresence(orgId: string, e: Event): void {
+		const me = (e as MessageEvent).data;
+		let payload: PresenceChangedEvent;
+		try {
+			payload = JSON.parse(me);
+		} catch (err) {
+			this.opts.handlers.onError?.(orgId, err);
+			return;
+		}
+		const cb = this.opts.handlers.onPresenceChanged;
+		if (!cb) return;
+		Promise.resolve(cb(payload)).catch((err) => this.opts.handlers.onError?.(orgId, err));
 	}
 }
