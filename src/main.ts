@@ -620,6 +620,14 @@ export default class MayaspacePlugin extends Plugin {
 				// must reach the plugin via the periodic poll, not just on next login.
 				onOrgPermissions: (perms) => this.applyOrgPermissions(perms),
 				onFilePermissions: (fileId, perms) => { this.settings.filePermissions[fileId] = perms; },
+				onFileLost: (path, mapping) => {
+					this.stopPrefetch(path);
+					if (this.liveCollab.activePaths().includes(path)) {
+						void this.liveCollab.detach(path).catch(() => undefined);
+					}
+					delete this.settings.filePermissions[mapping.fileId];
+					new Notice("MayaSpace: 접근 권한이 없어 로컬에서 제거되었습니다.");
+				},
 				onError: (e) => console.warn("[mayaspace] poller", e),
 			},
 			this.settings.treePollIntervalSec * 1000,

@@ -39,6 +39,8 @@ export interface PollerHooks {
 	onOrgPermissions?(perms: Record<string, number>): Promise<void> | void;
 	/** 파일별 effective_permissions 전달. 캐시 갱신용. */
 	onFilePermissions?(fileId: string, perms: number): void;
+	/** 권한 회수/서버 삭제로 로컬 파일을 지우기 직전 호출. prefetch 중단·detach·Notice용. */
+	onFileLost?(path: string, mapping: { orgId: string; fileId: string }): void;
 	onError?(e: unknown): void;
 }
 
@@ -118,6 +120,7 @@ export class TreePoller {
 			if (mapping.orgId !== org.id) continue;
 			if (serverPaths.has(path)) continue;
 			if (!path.startsWith(orgFolder + "/")) continue;
+			this.hooks.onFileLost?.(path, mapping);
 			try { await this.vault.delete(path); }
 			catch (e) { /* file may already be gone */ }
 			await this.hooks.removeFileMapping(path);
