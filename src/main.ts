@@ -301,11 +301,11 @@ export default class MayaspacePlugin extends Plugin {
 		});
 		this.addCommand({
 			id: "open-admin",
-			name: "MayaSpace: Open admin site",
+			name: "MayaSpace: Open web dashboard",
 			callback: () => {
-				const base = this.settings.serverUrl.replace(/\/+$/, "");
-				if (!base) { new Notice("Set REST URL first."); return; }
-				window.open(`${base}/admin`, "_blank");
+				const base = this.settings.webAppUrl.replace(/\/+$/, "");
+				if (!base) { new Notice("Set Web app URL first."); return; }
+				window.open(`${base}/dashboard`, "_blank");
 			},
 		});
 		this.addCommand({
@@ -443,10 +443,10 @@ export default class MayaspacePlugin extends Plugin {
 	}
 
 	async startSignup(): Promise<void> {
-		// 가입은 브라우저에서. 가입 후 플러그인에서 "Sign in"으로 device flow 인증한다.
-		const base = this.settings.serverUrl.replace(/\/+$/, "");
-		if (!base) { new Notice("먼저 서버 URL을 설정하세요."); return; }
-		window.open(`${base}/login/signup`, "_blank");
+		// 가입은 브라우저(고객 웹앱)에서. 가입 후 플러그인에서 "Sign in"으로 device flow 인증한다.
+		const base = this.settings.webAppUrl.replace(/\/+$/, "");
+		if (!base) { new Notice("먼저 Web app URL을 설정하세요."); return; }
+		window.open(`${base}/signup`, "_blank");
 		new Notice("브라우저에서 가입한 뒤, 플러그인에서 'Sign in'으로 로그인하세요.");
 	}
 

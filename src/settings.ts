@@ -6,6 +6,8 @@ import type { FileMapping } from "./vault/tree-sync";
 export interface MayaspaceSettings {
 	serverUrl: string;
 	wsUrl: string;
+	/** 고객 웹앱(apps/web) 주소. 가입·대시보드를 브라우저로 열 때 사용. REST/WS(serverUrl)와 별개. */
+	webAppUrl: string;
 	displayName: string;
 	mayaspaceRoot: string;
 	treePollIntervalSec: number;
@@ -24,6 +26,7 @@ export interface MayaspaceSettings {
 export const DEFAULT_SETTINGS: MayaspaceSettings = {
 	serverUrl: "http://localhost:3000",
 	wsUrl: "ws://localhost:3001",
+	webAppUrl: "http://localhost:3002",
 	displayName: "",
 	mayaspaceRoot: "MayaSpace",
 	treePollIntervalSec: 30,
@@ -67,6 +70,19 @@ export class MayaspaceSettingTab extends PluginSettingTab {
 						this.plugin.settings.serverUrl = v.trim();
 						await this.plugin.saveSettings();
 						this.plugin.rebuildBackendClients();
+					}),
+			);
+
+		new Setting(root)
+			.setName("Web app URL")
+			.setDesc("가입·대시보드를 여는 고객 웹앱 주소 (apps/web).")
+			.addText((t) =>
+				t
+					.setPlaceholder("http://localhost:3002")
+					.setValue(this.plugin.settings.webAppUrl)
+					.onChange(async (v) => {
+						this.plugin.settings.webAppUrl = v.trim();
+						await this.plugin.saveSettings();
 					}),
 			);
 
@@ -181,20 +197,20 @@ export class MayaspaceSettingTab extends PluginSettingTab {
 			.setDesc("Manage organisations, members, and permissions in your browser.")
 			.addButton((btn) =>
 				btn
-					.setButtonText("Open admin site")
+					.setButtonText("Open web dashboard")
 					.setCta()
 					.onClick(() => this.openAdminSite()),
 			);
 	}
 
 	private openAdminSite(): void {
-		const base = this.plugin.settings.serverUrl.replace(/\/+$/, "");
+		const base = this.plugin.settings.webAppUrl.replace(/\/+$/, "");
 		if (!base) {
-			new Notice("MayaSpace: set the REST URL first.");
+			new Notice("MayaSpace: set the Web app URL first.");
 			return;
 		}
-		// Server only exposes GET /admin (dashboard); per-org actions are all POST forms.
-		window.open(`${base}/admin`, "_blank");
+		// 고객 웹앱(apps/web)의 대시보드를 연다.
+		window.open(`${base}/dashboard`, "_blank");
 	}
 
 	private renderDiagnosticsSection(root: HTMLElement): void {
