@@ -86,7 +86,12 @@ export class DeviceFlowModal extends Modal {
 				btn
 					.setButtonText("Open browser")
 					.setCta()
-					.onClick(() => window.open(session.verificationUri, "_blank")),
+					.onClick(() => {
+						// 코드를 함께 전달 → 승인 페이지에 prefill되어 한 번에 승인 가능.
+						const sep = session.verificationUri.includes("?") ? "&" : "?";
+						const url = `${session.verificationUri}${sep}code=${encodeURIComponent(session.userCode)}`;
+						window.open(url, "_blank");
+					}),
 			);
 
 		box.createEl("p", {
