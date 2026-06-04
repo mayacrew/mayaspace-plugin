@@ -19,8 +19,7 @@ import {
 
 import { MayaspaceAuth, type TokenSet } from "./auth/mayaspace-auth";
 import { PluginTokenStorage } from "./auth/token-storage";
-import { PasswordLoginModal } from "./auth/password-login-modal";
-import { SignupModal } from "./auth/signup-modal";
+import { DeviceFlowModal } from "./auth/device-flow-modal";
 import { ConfirmModal } from "./auth/confirm-modal";
 
 import { makeObsidianFetcher } from "./api/mayaspace-http";
@@ -438,25 +437,17 @@ export default class MayaspacePlugin extends Plugin {
 	};
 
 	async startConnect(): Promise<void> {
+		// Device flow: 플러그인은 비밀번호를 만지지 않는다. 코드 발급 → 브라우저에서 로그인/승인 → 토큰 수령.
 		const deviceName = `Obsidian (${navigator.platform || "desktop"})`;
-		new PasswordLoginModal(
-			this.app,
-			this.auth,
-			deviceName,
-			this.postAuthSuccess,
-			() => this.startSignup(),
-		).open();
+		new DeviceFlowModal(this.app, this.auth, deviceName, this.postAuthSuccess).open();
 	}
 
 	async startSignup(): Promise<void> {
-		const deviceName = `Obsidian (${navigator.platform || "desktop"})`;
-		new SignupModal(
-			this.app,
-			this.auth,
-			deviceName,
-			this.postAuthSuccess,
-			() => this.startConnect(),
-		).open();
+		// 가입은 브라우저에서. 가입 후 플러그인에서 "Sign in"으로 device flow 인증한다.
+		const base = this.settings.serverUrl.replace(/\/+$/, "");
+		if (!base) { new Notice("먼저 서버 URL을 설정하세요."); return; }
+		window.open(`${base}/login/signup`, "_blank");
+		new Notice("브라우저에서 가입한 뒤, 플러그인에서 'Sign in'으로 로그인하세요.");
 	}
 
 	doLogout(): void {
