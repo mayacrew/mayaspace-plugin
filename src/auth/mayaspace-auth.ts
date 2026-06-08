@@ -84,6 +84,7 @@ export class MayaspaceAuth {
 	) {}
 
 	private _cachedTokens: TokenSet | null | undefined;
+	private _refreshInFlight: Promise<string> | null = null;
 
 	async startDeviceFlow(deviceName: string): Promise<DeviceFlowSession> {
 		const res = await this.fetcher({
@@ -210,7 +211,23 @@ export class MayaspaceAuth {
 		this._cachedTokens = tokens;
 	}
 
+	/**
+	 * Single-flight: concurrent callers (prefetch, SSE reconnect, REST 401)
+	 * share one refresh round-trip instead of each rotating the token and
+	 * invalidating the others.
+	 */
 	private async refresh(refreshToken: string): Promise<string> {
+		if (this._refreshInFlight) return this._refreshInFlight;
+
+		this._refreshInFlight = this.doRefresh(refreshToken);
+		try {
+			return await this._refreshInFlight;
+		} finally {
+			this._refreshInFlight = null;
+		}
+	}
+
+	private async doRefresh(refreshToken: string): Promise<string> {
 		const res = await this.fetcher({
 			method: "POST",
 			url: `${this.baseUrl}/v1/auth/refresh`,
@@ -218,7 +235,17 @@ export class MayaspaceAuth {
 			body: JSON.stringify({ refresh_token: refreshToken }),
 		});
 		if (!res.ok) {
-			await this.logout();
+			// A stale token can fail after a concurrent caller already rotated it.
+			// Only log out when storage holds no usable token now.
+			const current = await this.storage.load();
+			if (current && current.refreshToken !== refreshToken) {
+				this._cachedTokens = current;
+				if (current.expiresAt - this.now() > REFRESH_THRESHOLD_MS) {
+					return current.accessToken;
+				}
+			} else {
+				await this.logout();
+			}
 			throw new AuthRefreshFailedError(res.status);
 		}
 		const body = await res.json<TokenResponse>();
