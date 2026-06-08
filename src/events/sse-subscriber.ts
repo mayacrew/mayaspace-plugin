@@ -2,7 +2,12 @@
  * Subscribe to per-org file event streams via SSE.
  *
  * GET /v1/orgs/:oid/events emits `file.created`, `file.deleted`, `file.moved`.
- * EventSource cannot send custom headers, so the JWT travels as `?token=`.
+ * EventSource cannot send custom headers, so authentication travels in the
+ * query string. We do NOT put the JWT there (it would leak into server logs /
+ * proxies). Instead the caller exchanges the JWT for a short-lived, single-use
+ * SSE ticket (POST /v1/auth/sse-ticket, 30s TTL) and we connect with
+ * `?ticket=`. Because the ticket is single-use, every (re)connect fetches a
+ * fresh one via getTicket().
  *
  * Events originating from this device are filtered using `deviceId` in the
  * payload (matched against our own device id from the JWT).
@@ -58,12 +63,12 @@ export interface EventsHandlers {
 export interface EventsClientOptions {
 	restUrl: string;
 	/**
-	 * Token provider, not a fixed string. EventSource can't change its URL on
-	 * reconnect, so we reconnect manually and call this each time to get a fresh
-	 * (auto-refreshed) token — otherwise a reconnect after the access token
-	 * expires retries forever with a dead token in the URL.
+	 * Single-use SSE ticket provider. Called on every (re)connect: the ticket
+	 * is consumed on connect and expires in ~30s, so a reconnect must fetch a
+	 * fresh one instead of reusing a dead ticket. Implemented by the caller as
+	 * POST /v1/auth/sse-ticket with the Bearer JWT.
 	 */
-	getToken: () => Promise<string>;
+	getTicket: () => Promise<string>;
 	myDeviceId: string;
 	handlers: EventsHandlers;
 	/** EventSource constructor (test injection). Defaults to globalThis.EventSource. */
@@ -116,14 +121,14 @@ export class MayaspaceEvents {
 		if (sub.source) { sub.source.close(); sub.source = null; }
 	}
 
-	// 매 (재)연결마다 새 토큰을 받아 EventSource를 연다.
+	// 매 (재)연결마다 새 단발성 ticket을 받아 EventSource를 연다.
 	private async connect(orgId: string): Promise<void> {
 		const sub = this.subs.get(orgId);
 		if (!sub || sub.closed) return;
 
-		let token: string;
+		let ticket: string;
 		try {
-			token = await this.opts.getToken();
+			ticket = await this.opts.getTicket();
 		} catch (err) {
 			this.opts.handlers.onError?.(orgId, err);
 			this.scheduleReconnect(orgId);
@@ -131,7 +136,7 @@ export class MayaspaceEvents {
 		}
 		if (sub.closed) return;
 
-		const url = `${this.opts.restUrl}/v1/orgs/${orgId}/events?token=${encodeURIComponent(token)}`;
+		const url = `${this.opts.restUrl}/v1/orgs/${orgId}/events?ticket=${encodeURIComponent(ticket)}`;
 		const es = new this.Ctor(url);
 		sub.source = es;
 

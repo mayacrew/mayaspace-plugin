@@ -24,7 +24,7 @@ class FakeEventSource {
 	}
 }
 
-// connect()는 getToken을 await한 뒤 EventSource를 만든다 — 마이크로태스크/타이머가
+// connect()는 getTicket을 await한 뒤 EventSource를 만든다 — 마이크로태스크/타이머가
 // 가라앉도록 한 틱 기다린다.
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
@@ -32,7 +32,7 @@ function make(handlers: EventsHandlers, myDeviceId = "self"): { events: Mayaspac
 	FakeEventSource.instances = [];
 	const events = new MayaspaceEvents({
 		restUrl: "http://x",
-		getToken: async () => "t",
+		getTicket: async () => "tk",
 		myDeviceId,
 		handlers,
 		eventSourceCtor: FakeEventSource as unknown as typeof EventSource,
@@ -43,15 +43,15 @@ function make(handlers: EventsHandlers, myDeviceId = "self"): { events: Mayaspac
 }
 
 describe("MayaspaceEvents", () => {
-	test("subscribe는 org당 한 EventSource를 만들고 token을 query로 붙인다", async () => {
+	test("subscribe는 org당 한 EventSource를 만들고 ticket을 query로 붙인다", async () => {
 		const { events, sources } = make({});
 		events.subscribe("org1");
 		events.subscribe("org1");
 		events.subscribe("org2");
 		await flush();
 		expect(sources).toHaveLength(2);
-		expect(sources[0].url).toBe("http://x/v1/orgs/org1/events?token=t");
-		expect(sources[1].url).toBe("http://x/v1/orgs/org2/events?token=t");
+		expect(sources[0].url).toBe("http://x/v1/orgs/org1/events?ticket=tk");
+		expect(sources[1].url).toBe("http://x/v1/orgs/org2/events?ticket=tk");
 	});
 
 	test("file.created/deleted/moved 이벤트는 해당 핸들러로 dispatch된다", async () => {
@@ -90,12 +90,12 @@ describe("MayaspaceEvents", () => {
 		expect(sources[1].closed).toBe(true);
 	});
 
-	test("연결 에러 시 이전 소스를 닫고 새 토큰으로 재연결한다", async () => {
+	test("연결 에러 시 이전 소스를 닫고 새 단발성 ticket으로 재연결한다", async () => {
 		let n = 0;
 		FakeEventSource.instances = [];
 		const events = new MayaspaceEvents({
 			restUrl: "http://x",
-			getToken: async () => `t${++n}`,
+			getTicket: async () => `tk${++n}`,
 			myDeviceId: "self",
 			handlers: {},
 			eventSourceCtor: FakeEventSource as unknown as typeof EventSource,
@@ -107,7 +107,7 @@ describe("MayaspaceEvents", () => {
 		events.subscribe("org1");
 		await flush();
 		expect(sources).toHaveLength(1);
-		expect(sources[0].url).toContain("token=t1");
+		expect(sources[0].url).toContain("ticket=tk1");
 
 		sources[0].fire("error", {});
 		await flush();
@@ -115,6 +115,6 @@ describe("MayaspaceEvents", () => {
 
 		expect(sources[0].closed).toBe(true);
 		expect(sources).toHaveLength(2);
-		expect(sources[1].url).toContain("token=t2");
+		expect(sources[1].url).toContain("ticket=tk2");
 	});
 });

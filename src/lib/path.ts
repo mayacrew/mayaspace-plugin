@@ -32,3 +32,38 @@ export function parseMayaspacePath(vaultPath: string, mayaspaceRoot: string): Ma
 export function sanitizeFolderName(name: string): string {
 	return name.replace(/\//g, "-");
 }
+
+// Server-relative paths arrive over SSE / REST and get joined onto the vault
+// root before vault.create / rename. A hostile or buggy server could send
+// '../', a drive prefix, or a reserved segment to escape the vault. Mirror the
+// server's canonical rules (common/path/canonical-path.ts) so a path that the
+// server would reject can't slip through the plugin either.
+const RESERVED_SEGMENTS = new Set([".trash"]);
+const WINDOWS_DRIVE = /^[a-zA-Z]:/;
+
+export class InvalidServerPathError extends Error {
+	constructor(value: string, reason: string) {
+		super(`Invalid server path (${reason}): ${value}`);
+	}
+}
+
+/**
+ * Normalise a server-relative path to canonical form and reject traversal /
+ * absolute / drive-prefixed / reserved inputs. Empty segments ('a//b', 'a/./b')
+ * are absorbed. Throws InvalidServerPathError when the path can't be trusted.
+ */
+export function canonicalServerPath(raw: string): string {
+	if (raw.includes("\\")) throw new InvalidServerPathError(raw, "backslash not allowed");
+	if (WINDOWS_DRIVE.test(raw)) throw new InvalidServerPathError(raw, "drive prefix not allowed");
+	if (raw.startsWith("/")) throw new InvalidServerPathError(raw, "absolute path not allowed");
+
+	const out: string[] = [];
+	for (const seg of raw.split("/")) {
+		if (seg === "" || seg === ".") continue;
+		if (seg === "..") throw new InvalidServerPathError(raw, "parent traversal not allowed");
+		if (RESERVED_SEGMENTS.has(seg)) throw new InvalidServerPathError(raw, `reserved segment "${seg}"`);
+		out.push(seg);
+	}
+	if (out.length === 0) throw new InvalidServerPathError(raw, "empty path");
+	return out.join("/");
+}

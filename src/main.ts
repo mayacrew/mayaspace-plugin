@@ -22,7 +22,7 @@ import { PluginTokenStorage } from "./auth/token-storage";
 import { DeviceFlowModal } from "./auth/device-flow-modal";
 import { ConfirmModal } from "./auth/confirm-modal";
 
-import { makeObsidianFetcher } from "./api/mayaspace-http";
+import { makeObsidianFetcher, type Fetcher } from "./api/mayaspace-http";
 import { MayaspaceApi, EtagMismatchError, type FileMeta } from "./api/mayaspace-api";
 
 import { MayaspaceSync, defaultHocuspocusFactory } from "./sync/mayaspace-sync";
@@ -39,7 +39,7 @@ import { makePeerIdentity } from "./ui/peer-identity";
 import { ExplorerDecorator, type SyncStatus } from "./ui/explorer-decorator";
 import { CollabSidebarView, VIEW_TYPE_COLLAB, type CollabSidebarCallbacks } from "./ui/collab-sidebar";
 
-import { parseMayaspacePath, sanitizeFolderName } from "./lib/path";
+import { parseMayaspacePath, sanitizeFolderName, canonicalServerPath } from "./lib/path";
 import { READ, UPDATE, CREATE, DELETE, can } from "./lib/permissions";
 import { checkCreate, checkUpdate, checkDelete, checkMove } from "./permissions/permission-guard";
 import { EditorView } from "@codemirror/view";
@@ -50,6 +50,9 @@ export default class MayaspacePlugin extends Plugin {
 	api!: MayaspaceApi;
 	sync!: MayaspaceSync;
 	liveCollab!: LiveCollabSession;
+	// HTTP transport, rebuilt with the other clients on URL change. Used for the
+	// SSE ticket POST, which lives outside MayaspaceApi (auth-owned surface).
+	private fetcher!: Fetcher;
 	mappings!: FileMappings;
 	decorator!: ExplorerDecorator;
 
@@ -60,10 +63,16 @@ export default class MayaspacePlugin extends Plugin {
 	private fileStatuses: Record<string, SyncStatus> = {};
 	private settingTab: MayaspaceSettingTab | null = null;
 	private prefetches = new Map<string, () => void>();
-	// Paths we just wrote via vault.modify ourselves. Used to suppress the
-	// resulting vault.on('modify') event so handleVaultModify doesn't treat
-	// our own dump as an external edit and re-PUT it to the server.
-	private selfWrites = new Map<string, ReturnType<typeof setTimeout>>();
+	// Most-recently-opened mapped paths, newest last. Bounds the live prefetch
+	// scope so a large vault doesn't open a session per file (see #6 / the
+	// prefetchAllFiles setting).
+	private recentlyOpened: string[] = [];
+	// path → hash of the content we last wrote via safeModify. handleVaultModify
+	// compares the modified file's content hash against this: a match means the
+	// event is the echo of our own write and is ignored; a mismatch is a real
+	// external edit and is propagated. A content hash (vs the old 1.5s timer)
+	// won't swallow an external edit that lands within the self-write window.
+	private selfWriteHashes = new Map<string, string>();
 	// Paths whose POST /files is currently in flight. The raw fs.watch under
 	// Obsidian fires vault.on('create') more than once for a single CLI
 	// write (and Obsidian's own index update can fire it again), so without
@@ -176,6 +185,7 @@ export default class MayaspacePlugin extends Plugin {
 			},
 		});
 		const fetcher = makeObsidianFetcher(requestUrl as any);
+		this.fetcher = fetcher;
 		this.auth = new MayaspaceAuth(this.settings.serverUrl, fetcher, tokenStorage);
 		this.api = new MayaspaceApi(this.settings.serverUrl, this.auth, fetcher);
 		this.sync = new MayaspaceSync(this.settings.wsUrl, this.auth, defaultHocuspocusFactory());
@@ -196,6 +206,33 @@ export default class MayaspacePlugin extends Plugin {
 			this.fileStatuses[path] = display;
 			this.decorator?.updateStatus(path, display);
 		});
+	}
+
+	/**
+	 * Tear down everything bound to the current server before swapping clients,
+	 * then rebuild and re-subscribe. Called when the REST/WS URL changes in
+	 * settings. Order matters: stop inbound streams and per-file sessions FIRST
+	 * (each prefetch cleanup closes on the sync it opened with), detach live
+	 * collaboration, close the OLD sync, then recreate clients + live session.
+	 * Without this, stale SSE/providers keep talking to the previous server and
+	 * could send its token there.
+	 */
+	async restartBackend(): Promise<void> {
+		this.events?.unsubscribeAll();
+		this.events = null;
+		this.treePoller?.stop();
+		this.treePoller = null;
+		this.stopAllPrefetches();
+		await this.liveCollab.detachAll();
+		await this.sync.closeAll();
+
+		this.rebuildBackendClients();
+		this.buildLiveCollab();
+
+		if (!this.settings.tokenSet) return;
+		await this.syncTrees().catch((e) => console.warn("[mayaspace] restartBackend sync", e));
+		this.startEventsSubscription();
+		this.restartTreePoller();
 	}
 
 	private buildLiveCollab(): void {
@@ -324,6 +361,11 @@ export default class MayaspacePlugin extends Plugin {
 				const mapping = file ? this.mappings.getFile(file.path) : null;
 				// 사이드바 컨텍스트는 즉시 갱신 — liveCollab attach보다 먼저.
 				this.updateSidebarContext(file.path);
+				// Opening a mapped file brings it into the live prefetch scope:
+				// start a background session so its remote edits stream in even
+				// when full-vault prefetch is off, and evict the oldest beyond
+				// the limit so the scope stays bounded.
+				if (mapping) this.noteRecentlyOpened(file.path, mapping);
 				// Defer to a macro task. queueMicrotask is too early: Obsidian
 				// fires file-open BEFORE it replaces the leaf's EditorState on
 				// in-leaf file switches, and the replacement happens in a
@@ -413,16 +455,14 @@ export default class MayaspacePlugin extends Plugin {
 	 * subsequent vault.on('modify') event. Without this guard, every dump
 	 * from prefetch / hydrate / detach would round-trip back to the server
 	 * as an "external edit" → write loop.
+	 *
+	 * We record the hash of the content we wrote (not a time window): the
+	 * resulting modify event(s) carry exactly this content, so handleVaultModify
+	 * matches by hash and ignores them, while an external edit arriving moments
+	 * later hashes differently and is still propagated.
 	 */
 	private async safeModify(file: TFile, content: string): Promise<void> {
-		const existing = this.selfWrites.get(file.path);
-		if (existing) clearTimeout(existing);
-		// Modify fires synchronously then OS file watcher fires it again
-		// shortly after. 1.5s covers both windows.
-		this.selfWrites.set(
-			file.path,
-			setTimeout(() => this.selfWrites.delete(file.path), 1500),
-		);
+		this.selfWriteHashes.set(file.path, hashContent(content));
 		await this.app.vault.modify(file, content);
 	}
 
@@ -472,6 +512,7 @@ export default class MayaspacePlugin extends Plugin {
 		this.stopAllPrefetches();
 		await this.liveCollab.detachAll();
 		await this.sync.closeAll();
+		await this.purgeAllCaches();
 		await this.auth.logout();
 		this.settings.tokenSet = null;
 		this.settings.accountEmail = null;
@@ -539,11 +580,15 @@ export default class MayaspacePlugin extends Plugin {
 	}
 
 	private async hydrateAllPlaceholders(): Promise<void> {
-		const entries = Object.entries(this.settings.fileMappings);
-		for (const [path, mapping] of entries) {
-			if (this.liveCollab.activePaths().includes(path)) continue;
-			await this.hydrateFile(path, mapping);
-		}
+		const entries = Object.entries(this.settings.fileMappings).filter(
+			([path]) => !this.liveCollab.activePaths().includes(path),
+		);
+		// Bounded concurrency: a large vault would otherwise either fire one REST
+		// read per file at once (connection flood) or crawl one-at-a-time. Run a
+		// small fixed number of workers over a shared queue.
+		await runBounded(HYDRATE_CONCURRENCY, entries, ([path, mapping]) =>
+			this.hydrateFile(path, mapping),
+		);
 	}
 
 	private async hydrateFile(path: string, mapping: FileMapping): Promise<void> {
@@ -579,15 +624,49 @@ export default class MayaspacePlugin extends Plugin {
 	// editor owns the content while it's visible.
 
 	private async startPrefetchAll(): Promise<void> {
-		for (const [path, mapping] of Object.entries(this.settings.fileMappings)) {
-			void this.startPrefetch(path, mapping);
+		const scope = this.settings.prefetchAllFiles
+			? Object.keys(this.settings.fileMappings)
+			: this.livePrefetchScope();
+		for (const path of scope) {
+			const mapping = this.settings.fileMappings[path];
+			if (mapping) void this.startPrefetch(path, mapping);
+		}
+	}
+
+	// Bounded set of paths that get a live background session when full-vault
+	// prefetch is off: the currently open file plus the most-recently-opened
+	// ones (and any already-active live-collab path). The rest stay fresh via
+	// tree polling + SSE invalidation + lazy hydration on open.
+	private livePrefetchScope(): string[] {
+		const scope = new Set<string>(this.liveCollab.activePaths());
+		const active = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (active?.file && this.mappings.getFile(active.file.path)) scope.add(active.file.path);
+		for (const path of this.recentlyOpened) scope.add(path);
+		return Array.from(scope).filter((p) => this.settings.fileMappings[p]);
+	}
+
+	private noteRecentlyOpened(path: string, mapping: FileMapping): void {
+		this.recentlyOpened = this.recentlyOpened.filter((p) => p !== path);
+		this.recentlyOpened.push(path);
+		const evicted = this.recentlyOpened.splice(0, Math.max(0, this.recentlyOpened.length - this.settings.livePrefetchLimit));
+		void this.startPrefetch(path, mapping);
+		// Evicted paths leave the live scope. Keep the session only if the file
+		// is still open in the editor (active-leaf prefetch); otherwise stop it
+		// so the scope stays bounded.
+		const stillOpen = new Set(this.liveCollab.activePaths());
+		for (const old of evicted) {
+			if (!stillOpen.has(old)) this.stopPrefetch(old);
 		}
 	}
 
 	private async startPrefetch(path: string, mapping: FileMapping): Promise<void> {
 		if (this.prefetches.has(path)) return;
+		// Capture the sync instance we open with. On server-URL change
+		// rebuildBackendClients() swaps this.sync for a new instance; cleanup
+		// must closeDoc on the SAME instance it opened, not the replacement.
+		const sync = this.sync;
 		try {
-			const handle = await this.sync.openDoc(mapping.orgId, mapping.fileId);
+			const handle = await sync.openDoc(mapping.orgId, mapping.fileId);
 			const ytext = (handle.doc as any).getText("content") as { toString(): string; observe(cb: () => void): void; unobserve(cb: () => void): void };
 			let timer: ReturnType<typeof setTimeout> | null = null;
 			const flush = async () => {
@@ -618,7 +697,7 @@ export default class MayaspacePlugin extends Plugin {
 			const cleanup = () => {
 				try { ytext.unobserve(observer); } catch { /* doc destroyed */ }
 				if (timer) clearTimeout(timer);
-				this.sync.closeDoc(mapping.orgId, mapping.fileId).catch(() => undefined);
+				sync.closeDoc(mapping.orgId, mapping.fileId).catch(() => undefined);
 			};
 			this.prefetches.set(path, cleanup);
 			// Immediate first flush in case the doc already has content.
@@ -638,6 +717,14 @@ export default class MayaspacePlugin extends Plugin {
 	private stopAllPrefetches(): void {
 		for (const path of Array.from(this.prefetches.keys())) {
 			this.stopPrefetch(path);
+		}
+	}
+
+	// Delete the on-disk IndexedDB snapshot for every mapped file. Called on
+	// logout so revoked / signed-out content doesn't stay cached on the device.
+	private async purgeAllCaches(): Promise<void> {
+		for (const mapping of Object.values(this.settings.fileMappings)) {
+			await this.sync.purgeDoc(mapping.orgId, mapping.fileId).catch(() => undefined);
 		}
 	}
 
@@ -674,6 +761,7 @@ export default class MayaspacePlugin extends Plugin {
 					if (this.liveCollab.activePaths().includes(path)) {
 						void this.liveCollab.detach(path).catch(() => undefined);
 					}
+					void this.sync.purgeDoc(mapping.orgId, mapping.fileId).catch(() => undefined);
 					delete this.settings.filePermissions[mapping.fileId];
 					new Notice("MayaSpace: 접근 권한이 없어 로컬에서 제거되었습니다.");
 				},
@@ -708,6 +796,7 @@ export default class MayaspacePlugin extends Plugin {
 					}
 					if (lostRead) {
 						this.stopPrefetch(path);
+						await this.sync.purgeDoc(m.orgId, m.fileId).catch(() => undefined);
 					}
 				}
 				if (lostRead) new Notice("MayaSpace: 읽기 권한이 회수되었습니다.");
@@ -729,6 +818,28 @@ export default class MayaspacePlugin extends Plugin {
 
 	// ---------- SSE ----------
 
+	/**
+	 * Exchange the Bearer JWT for a short-lived single-use SSE ticket so the
+	 * JWT never appears in the EventSource URL (server logs / proxies). Called
+	 * once per (re)connect by MayaspaceEvents — the ticket is consumed on
+	 * connect and expires in ~30s.
+	 */
+	private async fetchSseTicket(): Promise<string> {
+		const token = await this.auth.getValidAccessToken();
+		const res = await this.fetcher({
+			method: "POST",
+			url: `${this.settings.serverUrl}/v1/auth/sse-ticket`,
+			headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+		});
+		if (!res.ok) {
+			const errText = await res.text().catch(() => "");
+			throw new Error(`sse-ticket failed: ${res.status} ${errText}`);
+		}
+		const body = await res.json<{ ticket?: string }>();
+		if (!body.ticket) throw new Error("sse-ticket response missing ticket");
+		return body.ticket;
+	}
+
 	private startEventsSubscription(): void {
 		if (!this.settings.tokenSet) return;
 		this.events?.unsubscribeAll();
@@ -737,14 +848,17 @@ export default class MayaspacePlugin extends Plugin {
 		console.log("[mayaspace] SSE start: myDid=", did, "orgs=", Object.values(this.settings.orgMappings));
 		this.events = new MayaspaceEvents({
 			restUrl: this.settings.serverUrl,
-			getToken: () => this.auth.getValidAccessToken(),
+			getTicket: () => this.fetchSseTicket(),
 			myDeviceId: did,
 			handlers: {
 				onCreated: async (p) => {
 					console.log("[mayaspace] SSE onCreated", p);
 					const folder = this.findOrgFolder(p.orgId);
 					if (!folder) return;
-					const full = `${this.settings.mayaspaceRoot}/${folder}/${p.path}`;
+					let relPath: string;
+					try { relPath = canonicalServerPath(p.path); }
+					catch (e) { console.warn("[mayaspace] onCreated rejected path", p.path, e); return; }
+					const full = `${this.settings.mayaspaceRoot}/${folder}/${relPath}`;
 					// Register mapping BEFORE vault.create — vault.create fires
 					// vault.on('create') synchronously, and the handler would
 					// otherwise see no mapping and POST to the server → 409.
@@ -765,6 +879,7 @@ export default class MayaspacePlugin extends Plugin {
 					for (const [path, m] of Object.entries(this.settings.fileMappings)) {
 						if (m.orgId !== p.orgId || m.fileId !== p.fileId) continue;
 						this.stopPrefetch(path);
+						void this.sync.purgeDoc(m.orgId, m.fileId).catch(() => undefined);
 						// Delete mapping BEFORE vault.delete. Otherwise vault.delete
 						// fires vault.on('delete') → handleVaultDelete sees the
 						// mapping and POSTs DELETE to the server for an already-
@@ -780,7 +895,10 @@ export default class MayaspacePlugin extends Plugin {
 					console.log("[mayaspace] SSE onMoved", p);
 					const folder = this.findOrgFolder(p.orgId);
 					if (!folder) return;
-					const newFull = `${this.settings.mayaspaceRoot}/${folder}/${p.newPath}`;
+					let newRelPath: string;
+					try { newRelPath = canonicalServerPath(p.newPath); }
+					catch (e) { console.warn("[mayaspace] onMoved rejected path", p.newPath, e); return; }
+					const newFull = `${this.settings.mayaspaceRoot}/${folder}/${newRelPath}`;
 					// Find any existing local mapping for this fileId so we can
 					// rename the placeholder in place, preserving the user's
 					// open editor state if they were viewing it.
@@ -926,8 +1044,6 @@ export default class MayaspacePlugin extends Plugin {
 	 * keep us from racing or looping with our own writes.
 	 */
 	private async handleVaultModify(path: string): Promise<void> {
-		// Our own vault.modify call — ignore the resulting event.
-		if (this.selfWrites.has(path)) return;
 		const mapping = this.mappings.getFile(path);
 		if (!mapping) return; // not a mayaspace-tracked file
 		const perms = this.permsForFileId(mapping.orgId, mapping.fileId);
@@ -951,6 +1067,13 @@ export default class MayaspacePlugin extends Plugin {
 			console.warn("[mayaspace] vault.read failed", path, e);
 			return;
 		}
+
+		// Echo of our own safeModify write — content matches what we wrote, so
+		// ignore it instead of re-pushing. The OS watcher can fire modify twice
+		// for one write, so we keep the recorded hash (don't delete it here):
+		// both echoes match and stay suppressed. An external edit lands with a
+		// different hash and falls through to the push below.
+		if (this.selfWriteHashes.get(path) === hashContent(content)) return;
 
 		// If a Hocuspocus session is open for this file (prefetch keeps one
 		// per mapping), push through ytext so the change broadcasts to every
@@ -1046,6 +1169,7 @@ export default class MayaspacePlugin extends Plugin {
 			return;
 		}
 		this.stopPrefetch(path);
+		await this.sync.purgeDoc(mapping.orgId, mapping.fileId).catch(() => undefined);
 		try {
 			await this.api.deleteFile(mapping.orgId, mapping.fileId);
 		} catch (e) {
@@ -1157,6 +1281,40 @@ function decodeJwtPayload(token: string): { sub?: string; did?: string; email?: 
 
 function describe(e: unknown): string {
 	return e instanceof Error ? e.message : String(e);
+}
+
+// Cap on simultaneous REST hydrate reads (see hydrateAllPlaceholders / #6).
+const HYDRATE_CONCURRENCY = 4;
+
+/**
+ * Run `worker` over `items` with at most `limit` in flight at once. A shared
+ * cursor feeds the workers so a slow item doesn't stall the others. Rejections
+ * are swallowed per item (worker is expected to handle its own errors).
+ */
+async function runBounded<T>(limit: number, items: T[], worker: (item: T) => Promise<void>): Promise<void> {
+	let cursor = 0;
+	const runOne = async (): Promise<void> => {
+		while (cursor < items.length) {
+			const item = items[cursor++];
+			await worker(item).catch(() => undefined);
+		}
+	};
+	const workers = Array.from({ length: Math.min(limit, items.length) }, runOne);
+	await Promise.all(workers);
+}
+
+/**
+ * Fast non-cryptographic content hash (FNV-1a) for self-write detection. We
+ * only need to tell "is this byte-for-byte the content I just wrote" apart from
+ * "someone else changed it", so collision resistance isn't required.
+ */
+function hashContent(s: string): string {
+	let h = 0x811c9dc5;
+	for (let i = 0; i < s.length; i++) {
+		h ^= s.charCodeAt(i);
+		h = Math.imul(h, 0x01000193);
+	}
+	return (h >>> 0).toString(16);
 }
 
 /**

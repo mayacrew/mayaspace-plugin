@@ -1,4 +1,4 @@
-import { parseMayaspacePath, sanitizeFolderName } from "./path";
+import { parseMayaspacePath, sanitizeFolderName, canonicalServerPath, InvalidServerPathError } from "./path";
 
 describe("parseMayaspacePath", () => {
 	test("정상: <root>/<org>/<relPath>", () => {
@@ -51,6 +51,43 @@ describe("parseMayaspacePath", () => {
 			orgName: "Big Org",
 			relPath: "file.md",
 		});
+	});
+});
+
+describe("canonicalServerPath", () => {
+	test("정상 경로는 그대로 통과", () => {
+		expect(canonicalServerPath("notes/idea.md")).toBe("notes/idea.md");
+	});
+
+	test("빈 segment / '.' 흡수해 정규화", () => {
+		expect(canonicalServerPath("a//b")).toBe("a/b");
+		expect(canonicalServerPath("a/./b")).toBe("a/b");
+		expect(canonicalServerPath("a/b/")).toBe("a/b");
+	});
+
+	test("'..' traversal 거부", () => {
+		expect(() => canonicalServerPath("allowed/../secret/a.md")).toThrow(InvalidServerPathError);
+	});
+
+	test("절대경로 거부", () => {
+		expect(() => canonicalServerPath("/etc/passwd")).toThrow(InvalidServerPathError);
+	});
+
+	test("backslash 거부", () => {
+		expect(() => canonicalServerPath("a\\b")).toThrow(InvalidServerPathError);
+	});
+
+	test("Windows drive prefix 거부", () => {
+		expect(() => canonicalServerPath("C:/secret.md")).toThrow(InvalidServerPathError);
+	});
+
+	test("예약 폴더(.trash) 거부", () => {
+		expect(() => canonicalServerPath(".trash/old.md")).toThrow(InvalidServerPathError);
+	});
+
+	test("빈 경로 거부", () => {
+		expect(() => canonicalServerPath("")).toThrow(InvalidServerPathError);
+		expect(() => canonicalServerPath("/")).toThrow(InvalidServerPathError);
 	});
 });
 

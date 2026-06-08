@@ -11,6 +11,17 @@ export interface MayaspaceSettings {
 	displayName: string;
 	mayaspaceRoot: string;
 	treePollIntervalSec: number;
+	/**
+	 * Open a background Hocuspocus session for EVERY mapped file at startup.
+	 * Off by default: a large vault would open hundreds–thousands of providers
+	 * (each a WebSocket + Y.Doc + IndexedDB store), exhausting memory/IO. With
+	 * it off, live prefetch is limited to the open + recently-opened files;
+	 * everything else stays fresh via tree polling, SSE invalidation, and
+	 * lazy hydration when the file is opened.
+	 */
+	prefetchAllFiles: boolean;
+	/** How many recently-opened files keep a live prefetch session. */
+	livePrefetchLimit: number;
 	tokenSet: TokenSet | null;
 	accountEmail: string | null;
 	/** sanitized org folder name → orgId */
@@ -24,12 +35,14 @@ export interface MayaspaceSettings {
 }
 
 export const DEFAULT_SETTINGS: MayaspaceSettings = {
-	serverUrl: "http://localhost:3000",
-	wsUrl: "ws://localhost:3001",
-	webAppUrl: "http://localhost:3002",
+	serverUrl: "https://api-mayaspace.supermembers.co.kr",
+	wsUrl: "wss://api-mayaspace.supermembers.co.kr/ws",
+	webAppUrl: "https://mayaspace.supermembers.co.kr",
 	displayName: "",
 	mayaspaceRoot: "MayaSpace",
 	treePollIntervalSec: 30,
+	prefetchAllFiles: false,
+	livePrefetchLimit: 20,
 	tokenSet: null,
 	accountEmail: null,
 	orgMappings: {},
@@ -69,7 +82,7 @@ export class MayaspaceSettingTab extends PluginSettingTab {
 					.onChange(async (v) => {
 						this.plugin.settings.serverUrl = v.trim();
 						await this.plugin.saveSettings();
-						this.plugin.rebuildBackendClients();
+						await this.plugin.restartBackend();
 					}),
 			);
 
@@ -96,7 +109,7 @@ export class MayaspaceSettingTab extends PluginSettingTab {
 					.onChange(async (v) => {
 						this.plugin.settings.wsUrl = v.trim();
 						await this.plugin.saveSettings();
-						this.plugin.rebuildBackendClients();
+						await this.plugin.restartBackend();
 					}),
 			);
 	}
@@ -175,6 +188,18 @@ export class MayaspaceSettingTab extends PluginSettingTab {
 						this.plugin.settings.treePollIntervalSec = Number.isFinite(n) && n >= 0 ? n : 30;
 						await this.plugin.saveSettings();
 						this.plugin.restartTreePoller();
+					}),
+			);
+
+		new Setting(root)
+			.setName("Prefetch all files")
+			.setDesc("모든 파일에 백그라운드 실시간 세션을 엽니다. 대용량 vault에서는 메모리·IO 폭주를 막기 위해 꺼두세요(기본). 끄면 열린/최근 파일만 실시간이고 나머지는 폴링·열 때 동기화됩니다.")
+			.addToggle((t) =>
+				t
+					.setValue(this.plugin.settings.prefetchAllFiles)
+					.onChange(async (v) => {
+						this.plugin.settings.prefetchAllFiles = v;
+						await this.plugin.saveSettings();
 					}),
 			);
 

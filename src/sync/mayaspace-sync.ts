@@ -113,6 +113,19 @@ export class MayaspaceSync {
 		this.entries.clear();
 	}
 
+	/**
+	 * Drop any live provider for this doc AND delete its on-disk IndexedDB
+	 * store. closeDoc only destroys the in-memory provider/persistence; the
+	 * persisted snapshot lingers, so document content survives logout / READ
+	 * revocation / delete locally. Call this on those paths so revoked content
+	 * doesn't stay cached on the device.
+	 */
+	async purgeDoc(orgId: string, fileId: string): Promise<void> {
+		const name = docName(orgId, fileId);
+		this.dropEntry(entryKey(orgId, fileId));
+		await deleteIndexedDb(name);
+	}
+
 	isOpen(orgId: string, fileId: string): boolean {
 		return this.entries.has(entryKey(orgId, fileId));
 	}
@@ -143,6 +156,25 @@ export class MayaspaceSync {
 
 function docName(orgId: string, fileId: string): string {
 	return `org:${orgId}:file:${fileId}`;
+}
+
+// IndexeddbPersistence opens one IndexedDB database per doc name, so deleting
+// that database removes the persisted Y.Doc snapshot. The provider/persistence
+// must be destroyed first (done by the caller) or the delete blocks on the
+// open connection.
+function deleteIndexedDb(name: string): Promise<void> {
+	return new Promise((resolve) => {
+		let req: IDBOpenDBRequest;
+		try {
+			req = indexedDB.deleteDatabase(name);
+		} catch {
+			resolve();
+			return;
+		}
+		req.onsuccess = () => resolve();
+		req.onerror = () => resolve();
+		req.onblocked = () => resolve();
+	});
 }
 
 function entryKey(orgId: string, fileId: string): string {
