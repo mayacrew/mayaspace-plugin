@@ -24,6 +24,25 @@ export interface FileHistoryEntry {
 	createdAt: string;
 }
 
+export interface VersionUser {
+	userId: string;
+	name: string | null;
+}
+
+export interface VersionListItem {
+	id: string;
+	kind: "auto_session" | "auto_periodic" | "manual";
+	label: string | null;
+	createdAt: string;
+	snapshotBytes: number | null;
+	createdBy: VersionUser | null;
+	contributors: VersionUser[];
+}
+
+export interface VersionContent {
+	content: string;
+}
+
 export interface FileAccessMember {
 	userId: string;
 	email: string;
@@ -126,6 +145,39 @@ export class MayaspaceApi {
 		return this.request<{ entries: FileHistoryEntry[]; nextCursor?: string }>(
 			"GET",
 			`/v1/orgs/${enc(orgId)}/files/${enc(fileId)}/history${qs ? `?${qs}` : ""}`,
+		);
+	}
+
+	// ---- Versions (타임머신) ----
+	listVersions(orgId: string, fileId: string): Promise<VersionListItem[]> {
+		return this.request<VersionListItem[]>(
+			"GET",
+			`/v1/orgs/${enc(orgId)}/files/${enc(fileId)}/versions`,
+		);
+	}
+	getVersion(orgId: string, fileId: string, versionId: string): Promise<VersionContent> {
+		return this.request<VersionContent>(
+			"GET",
+			`/v1/orgs/${enc(orgId)}/files/${enc(fileId)}/versions/${enc(versionId)}`,
+		);
+	}
+	createVersion(orgId: string, fileId: string, label?: string): Promise<VersionListItem> {
+		return this.request<VersionListItem>(
+			"POST",
+			`/v1/orgs/${enc(orgId)}/files/${enc(fileId)}/versions`,
+			{ body: label ? { label } : {} },
+		);
+	}
+	async restoreVersion(orgId: string, fileId: string, versionId: string): Promise<void> {
+		await this.request<void>(
+			"POST",
+			`/v1/orgs/${enc(orgId)}/files/${enc(fileId)}/versions/${enc(versionId)}/restore`,
+		);
+	}
+	async deleteVersion(orgId: string, fileId: string, versionId: string): Promise<void> {
+		await this.request<void>(
+			"DELETE",
+			`/v1/orgs/${enc(orgId)}/files/${enc(fileId)}/versions/${enc(versionId)}`,
 		);
 	}
 

@@ -9,8 +9,9 @@
  * 데이터를 요청한다 (sync 레이어 직접 import 금지).
  */
 
-import { ItemView, WorkspaceLeaf } from "obsidian";
-import type { FileAccessMember, FileHistoryEntry } from "../api/mayaspace-api";
+import { ItemView, MarkdownRenderer, Modal, WorkspaceLeaf } from "obsidian";
+import type { FileAccessMember, FileHistoryEntry, VersionContent, VersionListItem } from "../api/mayaspace-api";
+import { diffLines } from "../lib/markdown-diff";
 
 export const VIEW_TYPE_COLLAB = "mayaspace-collab";
 
@@ -23,6 +24,18 @@ export interface CollabSidebarCallbacks {
 	getPresence: (orgId: string, fileId: string) => Promise<string[]>;
 	/** 현재 로그인 사용자의 email. */
 	getMyEmail: () => string | null;
+	/** 버전 목록 조회 (최신순). */
+	listVersions: (orgId: string, fileId: string) => Promise<VersionListItem[]>;
+	/** 한 버전의 markdown 본문 조회 (미리보기/diff용). */
+	getVersion: (orgId: string, fileId: string, versionId: string) => Promise<VersionContent>;
+	/** 수동 체크포인트 생성. */
+	createVersion: (orgId: string, fileId: string, label?: string) => Promise<VersionListItem>;
+	/** 버전 복원 (현재 본문을 그 버전으로 교체). */
+	restoreVersion: (orgId: string, fileId: string, versionId: string) => Promise<void>;
+	/** 수동 버전 삭제. */
+	deleteVersion: (orgId: string, fileId: string, versionId: string) => Promise<void>;
+	/** 복원 성공 후 해당 파일을 재하이드레이션 (서버 본문 반영). */
+	onRestored: (orgId: string, fileId: string, filePath: string) => void;
 }
 
 interface FileContext {
@@ -93,6 +106,7 @@ export class CollabSidebarView extends ItemView {
 
 		this.renderMembersSection(root);
 		this.renderHistorySection(root);
+		this.renderVersionsSection(root);
 	}
 
 	private renderMembersSection(root: HTMLElement): void {
@@ -186,6 +200,266 @@ export class CollabSidebarView extends ItemView {
 
 		const action = row.createSpan({ cls: "mayaspace-collab-history-action" });
 		action.setText(describeAction(entry.action, entry.meta));
+	}
+
+	// ---------- 버전 (타임머신) ----------
+
+	private renderVersionsSection(root: HTMLElement): void {
+		const section = root.createDiv({ cls: "mayaspace-collab-section mayaspace-versions" });
+
+		const header = section.createDiv({ cls: "mayaspace-versions-header" });
+		header.createEl("h5", { text: "버전" });
+		const saveBtn = header.createEl("button", { text: "버전 저장", cls: "mayaspace-versions-save" });
+		saveBtn.onclick = () => this.promptCreateVersion();
+
+		const timeline = section.createDiv({ cls: "mayaspace-versions-timeline" });
+		timeline.createEl("p", { text: "로딩 중...", cls: "mayaspace-collab-loading" });
+
+		// 미리보기/diff 패널은 행 클릭 시 채워진다.
+		section.createDiv({ cls: "mayaspace-versions-preview" });
+
+		const { orgId, fileId } = this.ctx!;
+		this.callbacks.listVersions(orgId, fileId).then((versions) => {
+			timeline.empty();
+			if (versions.length === 0) {
+				timeline.createEl("p", { text: "저장된 버전 없음" });
+				return;
+			}
+			for (const v of versions) {
+				this.renderVersionRow(timeline, versions, v);
+			}
+		}).catch(() => {
+			timeline.empty();
+			timeline.createEl("p", { text: "버전 로드 실패", cls: "mayaspace-collab-error" });
+		});
+	}
+
+	private renderVersionRow(parent: HTMLElement, all: VersionListItem[], v: VersionListItem): void {
+		const row = parent.createDiv({ cls: "mayaspace-versions-row" });
+
+		const ts = row.createSpan({ cls: "mayaspace-versions-ts" });
+		ts.setText(formatDate(v.createdAt));
+
+		const badge = row.createSpan({ cls: `mayaspace-versions-badge kind-${v.kind}` });
+		badge.setText(describeKind(v.kind));
+
+		if (v.label) {
+			const label = row.createSpan({ cls: "mayaspace-versions-label" });
+			label.setText(v.label);
+		}
+
+		const initials = row.createSpan({ cls: "mayaspace-versions-initials" });
+		initials.setText(contributorInitials(v));
+
+		row.onclick = () => this.openVersionPreview(all, v);
+	}
+
+	private async promptCreateVersion(): Promise<void> {
+		if (!this.ctx) return;
+		const { orgId, fileId } = this.ctx;
+		const label = await promptLabel(this.app, "버전 저장", "라벨 (선택)");
+		if (label === null) return; // 취소
+		try {
+			await this.callbacks.createVersion(orgId, fileId, label || undefined);
+			this.render();
+		} catch {
+			this.render();
+		}
+	}
+
+	private async openVersionPreview(all: VersionListItem[], v: VersionListItem): Promise<void> {
+		if (!this.ctx) return;
+		const panel = this.contentEl.querySelector<HTMLElement>(".mayaspace-versions-preview");
+		if (!panel) return;
+		const { orgId, fileId, filePath } = this.ctx;
+
+		panel.empty();
+		panel.createEl("p", { text: "본문 로딩 중...", cls: "mayaspace-collab-loading" });
+
+		let content: string;
+		try {
+			content = (await this.callbacks.getVersion(orgId, fileId, v.id)).content;
+		} catch {
+			panel.empty();
+			panel.createEl("p", { text: "버전 본문 로드 실패", cls: "mayaspace-collab-error" });
+			return;
+		}
+
+		panel.empty();
+		const toolbar = panel.createDiv({ cls: "mayaspace-versions-preview-toolbar" });
+
+		const body = panel.createDiv({ cls: "mayaspace-versions-preview-body" });
+		this.renderMarkdown(body, content, filePath);
+
+		const diffBtn = toolbar.createEl("button", { text: "변경점 보기" });
+		let showingDiff = false;
+		diffBtn.onclick = () => {
+			showingDiff = !showingDiff;
+			diffBtn.setText(showingDiff ? "본문 보기" : "변경점 보기");
+			body.empty();
+			if (showingDiff) {
+				const prev = previousVersion(all, v);
+				void this.renderDiff(body, prev, orgId, fileId, content);
+			} else {
+				this.renderMarkdown(body, content, filePath);
+			}
+		};
+
+		const restoreBtn = toolbar.createEl("button", { text: "이 버전으로 복원", cls: "mod-cta" });
+		restoreBtn.onclick = () => this.confirmRestore(v);
+
+		if (v.kind === "manual") {
+			const deleteBtn = toolbar.createEl("button", { text: "삭제", cls: "mod-warning" });
+			deleteBtn.onclick = () => this.confirmDelete(v);
+		}
+	}
+
+	private renderMarkdown(el: HTMLElement, markdown: string, sourcePath: string): void {
+		// MarkdownRenderer.render는 Obsidian의 안전한 렌더러를 거친다 (innerHTML 직접 주입 금지).
+		void MarkdownRenderer.render(this.app, markdown, el, sourcePath, this);
+	}
+
+	private async renderDiff(
+		el: HTMLElement,
+		prev: VersionListItem | null,
+		orgId: string,
+		fileId: string,
+		currentContent: string,
+	): Promise<void> {
+		const oldContent = prev
+			? (await this.callbacks.getVersion(orgId, fileId, prev.id).then((c) => c.content).catch(() => ""))
+			: "";
+		const lines = diffLines(oldContent, currentContent);
+		const pre = el.createEl("pre", { cls: "mayaspace-versions-diff" });
+		for (const line of lines) {
+			const prefix = line.type === "add" ? "+ " : line.type === "del" ? "- " : "  ";
+			const lineEl = pre.createDiv({ cls: `diff-line diff-${line.type}` });
+			lineEl.setText(prefix + line.text); // textContent 경유 — XSS 안전
+		}
+	}
+
+	private confirmRestore(v: VersionListItem): void {
+		if (!this.ctx) return;
+		const { orgId, fileId, filePath } = this.ctx;
+		const message = `${formatDate(v.createdAt)} 버전으로 현재 본문을 교체합니다. 계속할까요?`;
+		new ConfirmModal(this.app, "버전 복원", message, async () => {
+			await this.callbacks.restoreVersion(orgId, fileId, v.id);
+			this.callbacks.onRestored(orgId, fileId, filePath);
+			this.render();
+		}).open();
+	}
+
+	private confirmDelete(v: VersionListItem): void {
+		if (!this.ctx) return;
+		const { orgId, fileId } = this.ctx;
+		const message = `${formatDate(v.createdAt)} 수동 버전을 삭제합니다. 계속할까요?`;
+		new ConfirmModal(this.app, "버전 삭제", message, async () => {
+			await this.callbacks.deleteVersion(orgId, fileId, v.id);
+			this.render();
+		}).open();
+	}
+}
+
+function describeKind(kind: VersionListItem["kind"]): string {
+	switch (kind) {
+		case "manual": return "수동";
+		case "auto_periodic": return "주기";
+		case "auto_session": return "자동";
+		default: return kind;
+	}
+}
+
+function contributorInitials(v: VersionListItem): string {
+	const people = v.contributors.length > 0 ? v.contributors : v.createdBy ? [v.createdBy] : [];
+	const initials = people
+		.map((p) => (p.name ?? "?").trim().charAt(0).toUpperCase() || "?")
+		.slice(0, 3);
+	return initials.join(" ");
+}
+
+/** all은 최신순. v 바로 다음(더 오래된) 버전을 직전 버전으로 본다. */
+function previousVersion(all: VersionListItem[], v: VersionListItem): VersionListItem | null {
+	const idx = all.findIndex((x) => x.id === v.id);
+	if (idx < 0 || idx + 1 >= all.length) return null;
+	return all[idx + 1];
+}
+
+/** 라벨 입력 모달. 확인 시 입력값(빈 문자열 가능), 취소 시 null. */
+function promptLabel(app: import("obsidian").App, title: string, placeholder: string): Promise<string | null> {
+	return new Promise((resolve) => {
+		new LabelPromptModal(app, title, placeholder, resolve).open();
+	});
+}
+
+class LabelPromptModal extends Modal {
+	private value = "";
+	private settled = false;
+
+	constructor(
+		app: import("obsidian").App,
+		private readonly titleText: string,
+		private readonly placeholder: string,
+		private readonly onDone: (value: string | null) => void,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.titleEl.setText(this.titleText);
+		const input = this.contentEl.createEl("input", { type: "text" });
+		input.placeholder = this.placeholder;
+		input.oninput = () => { this.value = input.value; };
+		input.onkeydown = (e) => { if (e.key === "Enter") this.finish(this.value); };
+
+		const buttons = this.contentEl.createDiv({ cls: "modal-button-container" });
+		const ok = buttons.createEl("button", { text: "저장", cls: "mod-cta" });
+		ok.onclick = () => this.finish(this.value);
+		const cancel = buttons.createEl("button", { text: "취소" });
+		cancel.onclick = () => this.finish(null);
+
+		input.focus();
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+		this.finish(null); // X로 닫아도 취소로 처리
+	}
+
+	private finish(value: string | null): void {
+		if (this.settled) return;
+		this.settled = true;
+		this.onDone(value);
+		this.close();
+	}
+}
+
+class ConfirmModal extends Modal {
+	constructor(
+		app: import("obsidian").App,
+		private readonly titleText: string,
+		private readonly message: string,
+		private readonly onConfirm: () => Promise<void>,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.titleEl.setText(this.titleText);
+		this.contentEl.createEl("p", { text: this.message });
+
+		const buttons = this.contentEl.createDiv({ cls: "modal-button-container" });
+		const confirm = buttons.createEl("button", { text: "확인", cls: "mod-cta" });
+		confirm.onclick = async () => {
+			confirm.disabled = true;
+			try { await this.onConfirm(); }
+			finally { this.close(); }
+		};
+		const cancel = buttons.createEl("button", { text: "취소" });
+		cancel.onclick = () => this.close();
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
 	}
 }
 

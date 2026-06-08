@@ -276,6 +276,14 @@ export default class MayaspacePlugin extends Plugin {
 				return result.userIds;
 			},
 			getMyEmail: () => this.settings.accountEmail,
+			listVersions: (orgId, fileId) => this.api.listVersions(orgId, fileId),
+			getVersion: (orgId, fileId, versionId) => this.api.getVersion(orgId, fileId, versionId),
+			createVersion: (orgId, fileId, label) => this.api.createVersion(orgId, fileId, label),
+			restoreVersion: (orgId, fileId, versionId) => this.api.restoreVersion(orgId, fileId, versionId),
+			deleteVersion: (orgId, fileId, versionId) => this.api.deleteVersion(orgId, fileId, versionId),
+			onRestored: (orgId, fileId, filePath) => {
+				void this.rehydrateAfterRestore(orgId, fileId, filePath);
+			},
 		};
 
 		this.registerView(VIEW_TYPE_COLLAB, (leaf) => {
@@ -606,6 +614,26 @@ export default class MayaspacePlugin extends Plugin {
 			await this.safeModify(file, content);
 		} catch (e) {
 			console.warn("[mayaspace] hydrate failed", path, e);
+		}
+	}
+
+	/**
+	 * 복원 직후 호출. 파일이 라이브 협업 세션에 붙어 있으면 서버가 라이브 Y.Doc 본문을
+	 * 교체했으므로 Hocuspocus가 에디터로 흘려보낸다 — 여기서 손대지 않는다.
+	 * 세션이 없으면 서버 본문을 강제로 다시 읽어 vault에 반영한다 (hydrateFile은
+	 * 비어있지 않은 본문을 덮지 않으므로 이 경로가 따로 필요하다).
+	 */
+	private async rehydrateAfterRestore(orgId: string, fileId: string, path: string): Promise<void> {
+		if (this.liveCollab.activePaths().includes(path)) return;
+		try {
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (!(file instanceof TFile)) return;
+			const { content } = await this.api.readFile(orgId, fileId);
+			const current = await this.app.vault.read(file);
+			if (current === content) return;
+			await this.safeModify(file, content);
+		} catch (e) {
+			console.warn("[mayaspace] rehydrate after restore failed", path, e);
 		}
 	}
 
