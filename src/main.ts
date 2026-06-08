@@ -737,7 +737,7 @@ export default class MayaspacePlugin extends Plugin {
 		console.log("[mayaspace] SSE start: myDid=", did, "orgs=", Object.values(this.settings.orgMappings));
 		this.events = new MayaspaceEvents({
 			restUrl: this.settings.serverUrl,
-			token: this.settings.tokenSet.accessToken,
+			getToken: () => this.auth.getValidAccessToken(),
 			myDeviceId: did,
 			handlers: {
 				onCreated: async (p) => {

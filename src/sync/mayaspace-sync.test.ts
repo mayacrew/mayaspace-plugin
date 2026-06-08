@@ -3,10 +3,10 @@ import { MayaspaceAuth, InMemoryTokenStorage } from "../auth/mayaspace-auth";
 import * as Y from "yjs";
 
 function makeMockFactory() {
-	const created: Array<{ url: string; name: string; token: string }> = [];
+	const created: Array<{ url: string; name: string; getToken: () => Promise<string> }> = [];
 	const handles: ProviderHandle[] = [];
-	const factory: ProviderFactory = ({ url, name, token, onStatus, onAuthFailure }) => {
-		created.push({ url, name, token });
+	const factory: ProviderFactory = ({ url, name, getToken, onStatus, onAuthFailure }) => {
+		created.push({ url, name, getToken });
 		const doc = new Y.Doc();
 		const awareness = { destroy: jest.fn() } as any;
 		const handle: ProviderHandle = {
@@ -43,7 +43,7 @@ describe("MayaspaceSync.openDoc", () => {
 		expect(created).toHaveLength(1);
 		expect(created[0].name).toBe("org:org-1:file:file-9");
 		expect(created[0].url).toBe("ws://localhost:3001");
-		expect(created[0].token).toBe("AT-1");
+		expect(await created[0].getToken()).toBe("AT-1");
 		expect(handle.doc).toBeInstanceOf(Y.Doc);
 	});
 

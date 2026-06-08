@@ -24,35 +24,43 @@ class FakeEventSource {
 	}
 }
 
+// connect()는 getToken을 await한 뒤 EventSource를 만든다 — 마이크로태스크/타이머가
+// 가라앉도록 한 틱 기다린다.
+const flush = () => new Promise((r) => setTimeout(r, 0));
+
 function make(handlers: EventsHandlers, myDeviceId = "self"): { events: MayaspaceEvents; sources: FakeEventSource[] } {
 	FakeEventSource.instances = [];
 	const events = new MayaspaceEvents({
 		restUrl: "http://x",
-		token: "t",
+		getToken: async () => "t",
 		myDeviceId,
 		handlers,
 		eventSourceCtor: FakeEventSource as unknown as typeof EventSource,
+		reconnectBaseMs: 0,
+		reconnectMaxMs: 0,
 	});
 	return { events, sources: FakeEventSource.instances };
 }
 
 describe("MayaspaceEvents", () => {
-	test("subscribe는 org당 한 EventSource를 만들고 token을 query로 붙인다", () => {
+	test("subscribe는 org당 한 EventSource를 만들고 token을 query로 붙인다", async () => {
 		const { events, sources } = make({});
 		events.subscribe("org1");
 		events.subscribe("org1");
 		events.subscribe("org2");
+		await flush();
 		expect(sources).toHaveLength(2);
 		expect(sources[0].url).toBe("http://x/v1/orgs/org1/events?token=t");
 		expect(sources[1].url).toBe("http://x/v1/orgs/org2/events?token=t");
 	});
 
-	test("file.created/deleted/moved 이벤트는 해당 핸들러로 dispatch된다", () => {
+	test("file.created/deleted/moved 이벤트는 해당 핸들러로 dispatch된다", async () => {
 		const onCreated = jest.fn();
 		const onDeleted = jest.fn();
 		const onMoved = jest.fn();
 		const { events, sources } = make({ onCreated, onDeleted, onMoved });
 		events.subscribe("org1");
+		await flush();
 
 		sources[0].fire("file.created", { orgId: "org1", fileId: "f1", path: "a.md", deviceId: "peer" });
 		sources[0].fire("file.deleted", { orgId: "org1", fileId: "f2", path: "b.md", deviceId: "peer" });
@@ -63,20 +71,50 @@ describe("MayaspaceEvents", () => {
 		expect(onMoved).toHaveBeenCalledWith(expect.objectContaining({ fileId: "f3" }));
 	});
 
-	test("자기 deviceId가 발생시킨 이벤트는 거른다", () => {
+	test("자기 deviceId가 발생시킨 이벤트는 거른다", async () => {
 		const onCreated = jest.fn();
 		const { events, sources } = make({ onCreated }, "self");
 		events.subscribe("org1");
+		await flush();
 		sources[0].fire("file.created", { orgId: "org1", fileId: "f1", path: "a.md", deviceId: "self" });
 		expect(onCreated).not.toHaveBeenCalled();
 	});
 
-	test("unsubscribeAll은 모든 EventSource를 close한다", () => {
+	test("unsubscribeAll은 모든 EventSource를 close한다", async () => {
 		const { events, sources } = make({});
 		events.subscribe("org1");
 		events.subscribe("org2");
+		await flush();
 		events.unsubscribeAll();
 		expect(sources[0].closed).toBe(true);
 		expect(sources[1].closed).toBe(true);
+	});
+
+	test("연결 에러 시 이전 소스를 닫고 새 토큰으로 재연결한다", async () => {
+		let n = 0;
+		FakeEventSource.instances = [];
+		const events = new MayaspaceEvents({
+			restUrl: "http://x",
+			getToken: async () => `t${++n}`,
+			myDeviceId: "self",
+			handlers: {},
+			eventSourceCtor: FakeEventSource as unknown as typeof EventSource,
+			reconnectBaseMs: 0,
+			reconnectMaxMs: 0,
+		});
+		const sources = FakeEventSource.instances;
+
+		events.subscribe("org1");
+		await flush();
+		expect(sources).toHaveLength(1);
+		expect(sources[0].url).toContain("token=t1");
+
+		sources[0].fire("error", {});
+		await flush();
+		await flush();
+
+		expect(sources[0].closed).toBe(true);
+		expect(sources).toHaveLength(2);
+		expect(sources[1].url).toContain("token=t2");
 	});
 });

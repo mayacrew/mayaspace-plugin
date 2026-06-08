@@ -37,7 +37,12 @@ export type ProviderStatus = "connecting" | "connected" | "disconnected";
 export interface ProviderFactoryArgs {
 	url: string;
 	name: string;
-	token: string;
+	/**
+	 * Token provider, not a fixed string: HocuspocusProvider calls it on every
+	 * (re)connection, so a reconnect after the access token expires gets a fresh
+	 * (auto-refreshed) token instead of retrying forever with a dead one.
+	 */
+	getToken: () => Promise<string>;
 	onStatus?: (s: ProviderStatus) => void;
 	onAuthFailure?: () => void;
 }
@@ -73,11 +78,10 @@ export class MayaspaceSync {
 			return existing.handle;
 		}
 
-		const token = await this.auth.getValidAccessToken();
 		const handle = this.factory({
 			url: this.wsUrl,
 			name: docName(orgId, fileId),
-			token,
+			getToken: () => this.auth.getValidAccessToken(),
 			onStatus: (status) => {
 				for (const l of this.statusListeners) l({ orgId, fileId, status });
 			},
@@ -169,11 +173,12 @@ export function defaultHocuspocusFactory(): ProviderFactory {
 	// eslint-disable-next-line @typescript-eslint/no-var-requires
 	const { IndexeddbPersistence } = require("y-indexeddb");
 
-	return ({ url, name, token, onStatus, onAuthFailure }) => {
+	return ({ url, name, getToken, onStatus, onAuthFailure }) => {
 		const provider = new HocuspocusProvider({
 			url,
 			name,
-			token,
+			// 함수를 그대로 넘긴다 — provider가 매 (재)연결마다 호출해 새 토큰을 받는다.
+			token: getToken,
 			onStatus: (data: { status: ProviderStatus }) => onStatus?.(data.status),
 			onAuthenticationFailed: () => onAuthFailure?.(),
 		});
