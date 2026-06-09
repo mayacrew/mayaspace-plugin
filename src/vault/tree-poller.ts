@@ -21,7 +21,7 @@ export interface PollerVault {
 	getAbstractFileByPath(path: string): unknown | null;
 	create(path: string, content: string): Promise<unknown>;
 	createFolder(path: string): Promise<unknown>;
-	delete(path: string | unknown): Promise<void>;
+	delete(file: unknown): Promise<void>;
 }
 
 export interface PollerHooks {
@@ -94,9 +94,11 @@ export class TreePoller {
 		const tree = await this.api.getTree(org.id);
 
 		const serverPaths = new Set<string>();
+		const serverFileIds = new Set<string>();
 		for (const file of tree) {
 			const fullPath = `${orgFolder}/${file.path}`;
 			serverPaths.add(fullPath);
+			serverFileIds.add(file.id);
 			this.hooks.onFilePermissions?.(file.id, file.effective_permissions ?? 0);
 			const known = this.hooks.getKnownFiles()[fullPath];
 			if (known && known.fileId === file.id) continue;
@@ -120,10 +122,27 @@ export class TreePoller {
 			if (mapping.orgId !== org.id) continue;
 			if (serverPaths.has(path)) continue;
 			if (!path.startsWith(orgFolder + "/")) continue;
-			this.hooks.onFileLost?.(path, mapping);
-			try { await this.vault.delete(path); }
-			catch (e) { /* file may already be gone */ }
+			// A MOVED file keeps its fileId but lands at a new path. The old path
+			// drops out of serverPaths, but the fileId is still on the server.
+			// Treat that as a move, NOT a loss: skip onFileLost (which would
+			// purgeDoc the still-live doc, killing the new path's session and
+			// racing its IndexedDB persistence — "connection is closing"). The
+			// add-loop above already created the new-path mapping; here we only
+			// drop the stale old path. onMoved (SSE) handles the rename normally;
+			// this just covers the race where the poll runs before onMoved.
+			const moved = serverFileIds.has(mapping.fileId);
+			if (!moved) this.hooks.onFileLost?.(path, mapping);
+			// Remove the mapping BEFORE vault.delete. vault.delete fires
+			// vault.on('delete') even for programmatic deletes; if the mapping
+			// is still present, handleVaultDelete propagates a server DELETE for
+			// a DELETE-capable client (e.g. the org owner), turning this local
+			// reconcile-cleanup into a global delete for everyone.
 			await this.hooks.removeFileMapping(path);
+			const file = this.vault.getAbstractFileByPath(path);
+			if (file) {
+				try { await this.vault.delete(file); }
+				catch (e) { /* file may already be gone */ }
+			}
 		}
 	}
 
