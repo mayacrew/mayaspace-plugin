@@ -11,7 +11,8 @@
 
 import { ItemView, MarkdownRenderer, Modal, WorkspaceLeaf } from "obsidian";
 import type { FileAccessMember, FileHistoryEntry, VersionContent, VersionListItem } from "../api/mayaspace-api";
-import { diffLines } from "../lib/markdown-diff";
+import { diffRows, diffWords, collapseRows } from "../lib/markdown-diff";
+import type { DiffRow, WordPart } from "../lib/markdown-diff";
 
 export const VIEW_TYPE_COLLAB = "mayaspace-collab";
 
@@ -329,12 +330,70 @@ export class CollabSidebarView extends ItemView {
 		const oldContent = prev
 			? (await this.callbacks.getVersion(orgId, fileId, prev.id).then((c) => c.content).catch(() => ""))
 			: "";
-		const lines = diffLines(oldContent, currentContent);
-		const pre = el.createEl("pre", { cls: "mayaspace-versions-diff" });
-		for (const line of lines) {
-			const prefix = line.type === "add" ? "+ " : line.type === "del" ? "- " : "  ";
-			const lineEl = pre.createDiv({ cls: `diff-line diff-${line.type}` });
-			lineEl.setText(prefix + line.text); // textContent 경유 — XSS 안전
+
+		// GitHub식 통합 diff: 줄번호 gutter + 단어강조 + 변경 없는 구간 접기.
+		const segments = collapseRows(diffRows(oldContent, currentContent), 3);
+		const expanded = new Set<number>();
+
+		const paint = (): void => {
+			el.empty();
+			const table = el.createDiv({ cls: "mayaspace-versions-diff" });
+			segments.forEach((seg, idx) => {
+				if (seg.kind === "collapsed" && !expanded.has(idx)) {
+					const marker = table.createDiv({ cls: "diff-row diff-collapsed" });
+					marker.setText(`⋯ ${seg.rows.length}줄 동일 — 펼치기`);
+					marker.onclick = () => {
+						expanded.add(idx);
+						paint();
+					};
+					return;
+				}
+				this.renderDiffRows(table, seg.rows);
+			});
+		};
+
+		paint();
+	}
+
+	/** 한 세그먼트의 행들을 렌더. 변경 블록은 del/add를 짝지어 단어 강조한다. */
+	private renderDiffRows(table: HTMLElement, rows: DiffRow[]): void {
+		let i = 0;
+		while (i < rows.length) {
+			if (rows[i].type === "same") {
+				this.renderDiffRow(table, rows[i], null);
+				i++;
+				continue;
+			}
+			let m = i;
+			while (m < rows.length && rows[m].type !== "same") m++;
+			const block = rows.slice(i, m);
+			const dels = block.filter((r) => r.type === "del");
+			const adds = block.filter((r) => r.type === "add");
+			dels.forEach((d, k) =>
+				this.renderDiffRow(table, d, adds[k] ? diffWords(d.text, adds[k].text).a : null),
+			);
+			adds.forEach((a, k) =>
+				this.renderDiffRow(table, a, dels[k] ? diffWords(dels[k].text, a.text).b : null),
+			);
+			i = m;
+		}
+	}
+
+	private renderDiffRow(table: HTMLElement, row: DiffRow, parts: WordPart[] | null): void {
+		const rowEl = table.createDiv({ cls: `diff-row diff-${row.type}` });
+		rowEl.createSpan({ cls: "diff-gutter", text: row.oldNo?.toString() ?? "" });
+		rowEl.createSpan({ cls: "diff-gutter", text: row.newNo?.toString() ?? "" });
+		const sign = row.type === "add" ? "+" : row.type === "del" ? "-" : " ";
+		rowEl.createSpan({ cls: "diff-sign", text: sign });
+		const content = rowEl.createSpan({ cls: "diff-content" });
+		if (parts) {
+			// 모두 textContent 경유 — innerHTML 미사용(XSS 안전).
+			for (const p of parts) {
+				if (p.changed) content.createSpan({ cls: "diff-word", text: p.text });
+				else content.appendText(p.text);
+			}
+		} else {
+			content.setText(row.text);
 		}
 	}
 

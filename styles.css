@@ -60,3 +60,132 @@
 .cm-ySelectionInfo:hover {
 	opacity: 1;
 }
+
+/* ---------- 버전 (타임머신) ---------- */
+.mayaspace-versions-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+}
+.mayaspace-versions-save {
+	font-size: var(--font-ui-smaller);
+}
+.mayaspace-versions-timeline {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	margin: 6px 0;
+}
+.mayaspace-versions-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 2px 4px;
+	border-radius: 4px;
+	cursor: pointer;
+}
+.mayaspace-versions-row:hover {
+	background: var(--background-modifier-hover);
+}
+.mayaspace-versions-ts {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+}
+.mayaspace-versions-label {
+	flex: 1 1 auto;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.mayaspace-versions-initials {
+	color: var(--text-faint);
+	font-size: var(--font-ui-smaller);
+}
+.mayaspace-versions-badge {
+	font-size: var(--font-ui-smaller);
+	padding: 0 6px;
+	border-radius: 8px;
+	background: var(--background-modifier-border);
+	color: var(--text-muted);
+}
+.mayaspace-versions-badge.kind-manual {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+.mayaspace-versions-preview-toolbar {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	margin: 8px 0;
+}
+
+/* ---------- GitHub식 통합 diff ---------- */
+.mayaspace-versions-diff {
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	line-height: 1.5;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	overflow-x: auto;
+}
+.mayaspace-versions-diff .diff-row {
+	display: flex;
+	align-items: baseline;
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+.diff-gutter {
+	flex: 0 0 auto;
+	min-width: 2.2em;
+	padding: 0 6px;
+	text-align: right;
+	color: var(--text-faint);
+	background: var(--background-secondary);
+	user-select: none;
+}
+.diff-sign {
+	flex: 0 0 auto;
+	width: 1.2em;
+	text-align: center;
+	user-select: none;
+	color: var(--text-muted);
+}
+.diff-content {
+	flex: 1 1 auto;
+	padding-right: 8px;
+}
+.diff-row.diff-add {
+	background: color-mix(in srgb, var(--color-green) 14%, transparent);
+}
+.diff-row.diff-add .diff-sign {
+	color: var(--color-green);
+}
+.diff-row.diff-del {
+	background: color-mix(in srgb, var(--color-red) 14%, transparent);
+}
+.diff-row.diff-del .diff-sign {
+	color: var(--color-red);
+}
+/* 줄 내 바뀐 토큰 강조 */
+.diff-row.diff-add .diff-word {
+	background: color-mix(in srgb, var(--color-green) 38%, transparent);
+	border-radius: 2px;
+}
+.diff-row.diff-del .diff-word {
+	background: color-mix(in srgb, var(--color-red) 38%, transparent);
+	border-radius: 2px;
+}
+/* 접힌 동일 구간 */
+.diff-row.diff-collapsed {
+	justify-content: center;
+	padding: 2px 0;
+	color: var(--text-muted);
+	background: var(--background-secondary);
+	cursor: pointer;
+	font-style: italic;
+}
+.diff-row.diff-collapsed:hover {
+	color: var(--text-normal);
+	background: var(--background-modifier-hover);
+}
