@@ -21,6 +21,8 @@ export interface FileCreatedEvent {
 	fileId: string;
 	path: string;
 	deviceId: string | null;
+	/** 수신자 기준 effective_permissions. 서버가 실어주면 권위값으로 캐시. */
+	effective_permissions?: number;
 }
 
 export interface FileDeletedEvent {
@@ -36,6 +38,8 @@ export interface FileMovedEvent {
 	oldPath: string;
 	newPath: string;
 	deviceId: string | null;
+	/** 수신자 기준 effective_permissions(새 경로). 서버가 실어주면 권위값으로 캐시. */
+	effective_permissions?: number;
 }
 
 export interface FileUpdatedEvent {

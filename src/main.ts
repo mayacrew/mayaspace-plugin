@@ -906,12 +906,13 @@ export default class MayaspacePlugin extends Plugin {
 					// vault.on('create') synchronously, and the handler would
 					// otherwise see no mapping and POST to the server → 409.
 					this.settings.fileMappings[full] = { orgId: p.orgId, fileId: p.fileId };
-					// SSE created 페이로드엔 effective_permissions가 없다. 폴더(형제)
-					// 기반으로 추정해 캐시해두면, 다음 tree-poll 전에 이 파일을 열어
-					// 편집할 때 permsForFileId가 org-root(=0)로 폴백해 "편집 권한 없음"
-					// 으로 오판하는 걸 막는다. tree-poller가 곧 권위값으로 갱신.
+					// 새 파일 권한 캐시: 서버가 실어준 권위값이 있으면 그걸 쓰고,
+					// 없으면 폴더(형제) 기반으로 추정한다. 이게 없으면 tree-poll 전에
+					// 이 파일을 편집할 때 permsForFileId가 org-root(=0)로 폴백해 "편집
+					// 권한 없음"으로 오판한다. tree-poller가 곧 권위값으로 갱신.
 					if (this.settings.filePermissions[p.fileId] === undefined) {
-						this.settings.filePermissions[p.fileId] = this.permsForNewPath(p.orgId, full);
+						this.settings.filePermissions[p.fileId] =
+							p.effective_permissions ?? this.permsForNewPath(p.orgId, full);
 					}
 					if (!this.app.vault.getAbstractFileByPath(full)) {
 						try { await this.app.vault.create(full, ""); } catch { /* race */ }
@@ -928,6 +929,12 @@ export default class MayaspacePlugin extends Plugin {
 					console.log("[mayaspace] SSE onDeleted", p);
 					for (const [path, m] of Object.entries(this.settings.fileMappings)) {
 						if (m.orgId !== p.orgId || m.fileId !== p.fileId) continue;
+						// Tear down the live editor binding BEFORE purgeDoc destroys
+						// the doc. Otherwise the yCollab ViewPlugin keeps transacting
+						// on a destroyed Y.Doc and the edits silently stop syncing.
+						if (this.liveCollab.activePaths().includes(path)) {
+							await this.liveCollab.detach(path).catch(() => undefined);
+						}
 						this.stopPrefetch(path);
 						void this.sync.purgeDoc(m.orgId, m.fileId).catch(() => undefined);
 						// Delete mapping BEFORE vault.delete. Otherwise vault.delete
@@ -965,9 +972,11 @@ export default class MayaspacePlugin extends Plugin {
 						this.stopPrefetch(oldFull);
 						delete this.settings.fileMappings[oldFull];
 						this.settings.fileMappings[newFull] = { orgId: p.orgId, fileId: p.fileId };
-						// 새 위치 기준 perms 추정 캐시 (onCreated와 동일 이유). 이미
-						// 캐시된 권위값이 있으면 보존하고 빈 경우만 채운다.
-						if (this.settings.filePermissions[p.fileId] === undefined) {
+						// 이동 후 새 경로 기준 권한. 이동은 권한 경계를 넘을 수 있으니
+						// 서버가 실어준 값이 있으면 권위값으로 갱신, 없으면 빈 경우만 추정.
+						if (p.effective_permissions !== undefined) {
+							this.settings.filePermissions[p.fileId] = p.effective_permissions;
+						} else if (this.settings.filePermissions[p.fileId] === undefined) {
 							this.settings.filePermissions[p.fileId] = this.permsForNewPath(p.orgId, newFull);
 						}
 						const oldAbstract = this.app.vault.getAbstractFileByPath(oldFull);
