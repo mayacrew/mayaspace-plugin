@@ -817,18 +817,33 @@ export default class MayaspacePlugin extends Plugin {
 			const gainedRead = !(before & READ) && !!(after & READ);
 
 			if (lostRead || lostUpdate) {
+				let removed = 0;
 				for (const [path, m] of Object.entries(this.settings.fileMappings)) {
 					if (m.orgId !== orgId) continue;
 					if (this.liveCollab.activePaths().includes(path)) {
 						await this.liveCollab.detach(path).catch(() => undefined);
 					}
 					if (lostRead) {
+						// 읽기 권한이 사라지면 로컬 .md까지 지운다. 씽크파일만 지우면
+						// .md에 마지막 동기화 본문이 남아 회수된 유저가 계속 읽을 수 있다.
+						// 서버가 원본이라 재초대·권한 복구 시 tree-poller가 다시 받아온다.
 						this.stopPrefetch(path);
 						await this.sync.purgeDoc(m.orgId, m.fileId).catch(() => undefined);
+						// 매핑을 먼저 지운다. vault.delete가 vault.on('delete') →
+						// handleVaultDelete를 부르는데, 매핑이 남아 있으면 이미 권한 없는
+						// 파일을 서버에 또 DELETE 시도한다.
+						delete this.settings.fileMappings[path];
+						delete this.settings.filePermissions[m.fileId];
+						const f = this.app.vault.getAbstractFileByPath(path);
+						if (f) await this.app.vault.delete(f).catch(() => undefined);
+						removed++;
 					}
 				}
-				if (lostRead) new Notice("MayaSpace: 읽기 권한이 회수되었습니다.");
-				else if (lostUpdate) new Notice("MayaSpace: 편집 권한이 회수되었습니다.");
+				if (lostRead) {
+					await this.saveSettings();
+					this.decorator.refresh();
+					new Notice(`MayaSpace: 읽기 권한이 회수되어 ${removed}개 파일을 로컬에서 제거했습니다.`);
+				} else if (lostUpdate) new Notice("MayaSpace: 편집 권한이 회수되었습니다.");
 			}
 
 			// 권한 회복 시 prefetch 재시작 — 회수 사이클로 prefetch가 죽었으면
