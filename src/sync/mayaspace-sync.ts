@@ -190,9 +190,25 @@ function deleteIndexedDb(name: string): Promise<void> {
 			resolve();
 			return;
 		}
-		req.onsuccess = () => resolve();
-		req.onerror = () => resolve();
-		req.onblocked = () => resolve();
+		let done = false;
+		let timer: ReturnType<typeof setTimeout>;
+		const finish = () => {
+			if (done) return;
+			done = true;
+			clearTimeout(timer);
+			resolve();
+		};
+		req.onsuccess = finish;
+		req.onerror = finish;
+		// Do NOT resolve on 'blocked'. A blocked delete is still pending — it
+		// fires once the open connection closes. Resolving here lets openDoc
+		// (which awaits this purge) open a fresh IndexeddbPersistence on the same
+		// store before the delete completes; the pending delete then runs under
+		// the new connection → "database connection is closing" on the next edit.
+		// Wait for the real completion; fall back after a timeout so a stuck
+		// connection can't deadlock the purge.
+		req.onblocked = () => { /* keep waiting for success/error */ };
+		timer = setTimeout(finish, 3000);
 	});
 }
 
