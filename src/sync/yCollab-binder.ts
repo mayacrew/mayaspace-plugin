@@ -14,7 +14,7 @@
 
 import { Compartment, StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { yCollab } from "y-codemirror.next";
+import { ySync, ySyncFacet, YSyncConfig } from "y-codemirror.next";
 import * as Y from "yjs";
 import { detachYExtension } from "./editor-binding";
 import type { PeerIdentity } from "../ui/peer-identity";
@@ -35,7 +35,14 @@ export function bindYCollab(
 
 	handle.awareness.setLocalStateField("user", identity);
 
-	const ext = yCollab(ytext, handle.awareness);
+	// Build the content-sync core WITHOUT yCollab's yRemoteSelections. That
+	// plugin's update() calls editor.doc.lineAt(index) with an index resolved
+	// against the shared Y.Doc; when the local editor lags ytext (Korean IME
+	// composition defers CodeMirror transactions while remote edits stream in)
+	// the index exceeds the editor doc length → RangeError → the ViewPlugin
+	// dies and the client stops applying remote updates (one-sided desync).
+	// Dropping remote-cursor rendering removes the crash; content sync stays.
+	const ext = [ySyncFacet.of(new YSyncConfig(ytext, handle.awareness)), ySync];
 
 	// Probe whether ytext is recognised as the same Y.Text class our bundle
 	// knows about. If instanceof fails, ySyncPlugin will silently refuse to
