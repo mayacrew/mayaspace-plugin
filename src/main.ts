@@ -906,6 +906,13 @@ export default class MayaspacePlugin extends Plugin {
 					// vault.on('create') synchronously, and the handler would
 					// otherwise see no mapping and POST to the server → 409.
 					this.settings.fileMappings[full] = { orgId: p.orgId, fileId: p.fileId };
+					// SSE created 페이로드엔 effective_permissions가 없다. 폴더(형제)
+					// 기반으로 추정해 캐시해두면, 다음 tree-poll 전에 이 파일을 열어
+					// 편집할 때 permsForFileId가 org-root(=0)로 폴백해 "편집 권한 없음"
+					// 으로 오판하는 걸 막는다. tree-poller가 곧 권위값으로 갱신.
+					if (this.settings.filePermissions[p.fileId] === undefined) {
+						this.settings.filePermissions[p.fileId] = this.permsForNewPath(p.orgId, full);
+					}
 					if (!this.app.vault.getAbstractFileByPath(full)) {
 						try { await this.app.vault.create(full, ""); } catch { /* race */ }
 					}
@@ -958,6 +965,11 @@ export default class MayaspacePlugin extends Plugin {
 						this.stopPrefetch(oldFull);
 						delete this.settings.fileMappings[oldFull];
 						this.settings.fileMappings[newFull] = { orgId: p.orgId, fileId: p.fileId };
+						// 새 위치 기준 perms 추정 캐시 (onCreated와 동일 이유). 이미
+						// 캐시된 권위값이 있으면 보존하고 빈 경우만 채운다.
+						if (this.settings.filePermissions[p.fileId] === undefined) {
+							this.settings.filePermissions[p.fileId] = this.permsForNewPath(p.orgId, newFull);
+						}
 						const oldAbstract = this.app.vault.getAbstractFileByPath(oldFull);
 						if (oldAbstract) {
 							try { await this.app.vault.rename(oldAbstract, newFull); }
@@ -1071,14 +1083,26 @@ export default class MayaspacePlugin extends Plugin {
 				return;
 			}
 			this.settings.fileMappings[path] = { orgId, fileId: meta.id };
+			this.settings.filePermissions[meta.id] = perms;
 			await this.saveSettings();
 			this.decorator.refresh();
+			await this.attachCreatedFileIfActive(path, { orgId, fileId: meta.id });
 			// Start a background prefetch session so future external/remote
 			// edits on this file stream into the vault automatically.
 			void this.startPrefetch(path, { orgId, fileId: meta.id });
 		} finally {
 			this.inflightCreates.delete(path);
 		}
+	}
+
+	private async attachCreatedFileIfActive(path: string, mapping: FileMapping): Promise<void> {
+		const active = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!active?.file || active.file.path !== path) return;
+		if (!can(this.permsForFileId(mapping.orgId, mapping.fileId), UPDATE)) return;
+		await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+		await this.liveCollab.attach(path, mapping).catch((e) =>
+			console.warn("[mayaspace] attach newly-created file failed", path, e),
+		);
 	}
 
 	/**
