@@ -85,4 +85,31 @@ describe("MayaspaceSync.purgeDoc", () => {
 		const sync = new MayaspaceSync("ws://localhost:3001", await authedAuth(), mockFactory());
 		await expect(sync.purgeDoc("o", "missing")).resolves.toBeUndefined();
 	});
+
+	test("purge 진행 중 openDoc은 삭제 완료를 기다린다 (재오픈↔IndexedDB 삭제 레이스 방지)", async () => {
+		const docName = "org:o:file:f";
+		await seedSnapshot(docName, "x"); // 실제 store가 있어야 delete가 비동기로 걸림
+
+		let factoryCalled = false;
+		const factory: ProviderFactory = () => {
+			factoryCalled = true;
+			const doc = new Y.Doc();
+			return { doc, awareness: { destroy: jest.fn() } as any, destroy: jest.fn(), whenSynced: Promise.resolve() };
+		};
+		const sync = new MayaspaceSync("ws://localhost:3001", await authedAuth(), factory);
+
+		const purgeP = sync.purgeDoc("o", "f"); // deleteIndexedDb 시작 + purges에 등록
+		const openP = sync.openDoc("o", "f"); // purge 대기해야 함
+
+		// 수정 전이라면 openDoc이 factory를 동기 호출. 수정 후엔 purge를 await하므로
+		// 이 시점엔 아직 provider가 안 만들어져 있어야 한다.
+		expect(factoryCalled).toBe(false);
+
+		await Promise.all([purgeP, openP]);
+		await idbSettle();
+
+		// purge 완료 후 provider 생성됨, 그리고 store는 깨끗.
+		expect(factoryCalled).toBe(true);
+		expect(sync.isOpen("o", "f")).toBe(true);
+	});
 });

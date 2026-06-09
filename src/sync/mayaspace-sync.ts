@@ -61,6 +61,9 @@ type StatusListener = (info: { orgId: string; fileId: string; status: ProviderSt
 
 export class MayaspaceSync {
 	private entries = new Map<string, OpenEntry>();
+	// In-flight purges keyed by doc. openDoc awaits these so a re-open never
+	// races the IndexedDB delete on the same store name.
+	private purges = new Map<string, Promise<void>>();
 	private permissionLostListeners: PermissionLostListener[] = [];
 	private statusListeners: StatusListener[] = [];
 
@@ -72,6 +75,13 @@ export class MayaspaceSync {
 
 	async openDoc(orgId: string, fileId: string): Promise<ProviderHandle> {
 		const key = entryKey(orgId, fileId);
+		// If a purge (IndexedDB delete) is in flight for this doc, wait for it to
+		// finish before opening a fresh provider. Otherwise the delete races the
+		// new IndexeddbPersistence on the same store name → "database connection
+		// is closing" and a half-synced session (the rename/revoke→reopen bug).
+		const pendingPurge = this.purges.get(key);
+		if (pendingPurge) await pendingPurge.catch(() => undefined);
+
 		const existing = this.entries.get(key);
 		if (existing) {
 			existing.refCount += 1;
@@ -121,9 +131,18 @@ export class MayaspaceSync {
 	 * doesn't stay cached on the device.
 	 */
 	async purgeDoc(orgId: string, fileId: string): Promise<void> {
+		const key = entryKey(orgId, fileId);
 		const name = docName(orgId, fileId);
-		this.dropEntry(entryKey(orgId, fileId));
-		await deleteIndexedDb(name);
+		this.dropEntry(key);
+		// Track the delete so a concurrent openDoc for the same doc waits for it
+		// to complete instead of opening a persistence on a store being deleted.
+		const p = deleteIndexedDb(name);
+		this.purges.set(key, p);
+		try {
+			await p;
+		} finally {
+			if (this.purges.get(key) === p) this.purges.delete(key);
+		}
 	}
 
 	isOpen(orgId: string, fileId: string): boolean {
