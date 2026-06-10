@@ -79,6 +79,9 @@ export default class MayaspacePlugin extends Plugin {
 	// this guard we'd race two creates → second one hits the (orgId,path)
 	// unique constraint on the server and surfaces a 500.
 	private inflightCreates = new Set<string>();
+	// Debounce timer for file-open → live-collab (re)binding. See file-open
+	// handler: coalesces rapid in-leaf file switching so it binds once settled.
+	private fileOpenTimer: ReturnType<typeof setTimeout> | null = null;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -144,6 +147,7 @@ export default class MayaspacePlugin extends Plugin {
 
 	async onunload(): Promise<void> {
 		this.treePoller?.stop();
+		if (this.fileOpenTimer) clearTimeout(this.fileOpenTimer);
 		this.events?.unsubscribeAll();
 		this.stopAllPrefetches();
 		await this.liveCollab.detachAll();
@@ -374,39 +378,17 @@ export default class MayaspacePlugin extends Plugin {
 				// when full-vault prefetch is off, and evict the oldest beyond
 				// the limit so the scope stays bounded.
 				if (mapping) this.noteRecentlyOpened(file.path, mapping);
-				// Defer to a macro task. queueMicrotask is too early: Obsidian
-				// fires file-open BEFORE it replaces the leaf's EditorState on
-				// in-leaf file switches, and the replacement happens in a
-				// later macro task. If we dispatch during the microtask flush,
-				// our compartment effect lands on a state that's about to be
-				// discarded — first attach (empty leaf) is fine, but every
-				// subsequent file switch in the same leaf silently drops the
-				// binding. setTimeout puts us after that replacement.
-				setTimeout(async () => {
-					// Detach every other active path FIRST. Obsidian reuses the
-					// same EditorView when the user switches files in a leaf;
-					// leaving a previous binding alive means the new attach
-					// stacks a second yCollab on the same view.
-					for (const other of this.liveCollab.activePaths()) {
-						if (other === file.path) continue;
-						await this.liveCollab.detach(other).catch(() => undefined);
-						delete this.fileStatuses[other];
-					}
-					if (!mapping) return;
-					// Wait one more frame after teardown so Obsidian has a
-					// chance to finish any follow-up reconfigure it does in
-					// response to the file change before we dispatch the new
-					// compartment.
-					await new Promise<void>((r) => requestAnimationFrame(() => r()));
-					const permsFileOpen = this.permsForFileId(mapping.orgId, mapping.fileId);
-					if (!can(permsFileOpen, UPDATE)) {
-						console.log("[mayaspace] skip live-collab attach: no UPDATE perm", file.path);
-						return;
-					}
-					await this.liveCollab.attach(file.path, mapping).catch((e) =>
-						console.warn("[mayaspace] attach failed", file.path, e),
-					);
-				}, 0);
+				// Debounce the (re)binding. With one leaf and fast file switching,
+				// binding on every file-open thrashes detach/attach and races
+				// Obsidian's EditorState replacement (it replaces the leaf's state
+				// on in-leaf switches), leaving the yCollab binding desynced from
+				// ytext. Coalesce rapid switches and bind once the user settles.
+				// The delay also clears Obsidian's state replacement (a later task).
+				if (this.fileOpenTimer) clearTimeout(this.fileOpenTimer);
+				this.fileOpenTimer = setTimeout(() => {
+					this.fileOpenTimer = null;
+					void this.rebindActiveFile(file.path, mapping ?? null);
+				}, FILE_OPEN_DEBOUNCE_MS);
 			}),
 		);
 
@@ -1268,6 +1250,34 @@ export default class MayaspacePlugin extends Plugin {
 		}
 	}
 
+	/**
+	 * Detach every other live session and (re)bind the now-settled file.
+	 * Called debounced from file-open so rapid in-leaf switching doesn't thrash
+	 * the binding lifecycle against Obsidian's EditorState replacement.
+	 */
+	private async rebindActiveFile(path: string, mapping: FileMapping | null): Promise<void> {
+		// Detach every other active path. Obsidian reuses the same EditorView
+		// when switching files in a leaf; a leftover binding would stack a
+		// second yCollab on the same view.
+		for (const other of this.liveCollab.activePaths()) {
+			if (other === path) continue;
+			await this.liveCollab.detach(other).catch(() => undefined);
+			delete this.fileStatuses[other];
+		}
+		if (!mapping) return;
+		// Wait one frame so Obsidian finishes any follow-up reconfigure before
+		// we dispatch the new compartment.
+		await new Promise<void>((r) => requestAnimationFrame(() => r()));
+		const perms = this.permsForFileId(mapping.orgId, mapping.fileId);
+		if (!can(perms, UPDATE)) {
+			console.log("[mayaspace] skip live-collab attach: no UPDATE perm", path);
+			return;
+		}
+		await this.liveCollab.attach(path, mapping).catch((e) =>
+			console.warn("[mayaspace] attach failed", path, e),
+		);
+	}
+
 	private findEditorViewForPath(path: string): EditorView | null {
 		// Prefer the active MarkdownView — that's the EditorView the user is
 		// actually looking at. Obsidian can have multiple leaves with the same
@@ -1361,6 +1371,10 @@ function describe(e: unknown): string {
 
 // Cap on simultaneous REST hydrate reads (see hydrateAllPlaceholders / #6).
 const HYDRATE_CONCURRENCY = 4;
+
+// Debounce for file-open → live-collab (re)bind. Long enough to coalesce rapid
+// in-leaf file switching, short enough to feel instant once the user settles.
+const FILE_OPEN_DEBOUNCE_MS = 150;
 
 /**
  * Run `worker` over `items` with at most `limit` in flight at once. A shared
