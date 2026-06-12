@@ -1144,6 +1144,34 @@ export default class MayaspacePlugin extends Plugin {
 
 		const file = this.app.vault.getAbstractFileByPath(path);
 		if (!(file instanceof TFile)) return;
+
+		// 이미지: ytext 경로(아래)는 텍스트 전용이므로 절대 타면 안 된다.
+		// REST PUT raw 바이너리로 직행한다. etag는 GET으로 받아온다(매핑에 없음).
+		if (isImagePath(path)) {
+			let data: ArrayBuffer;
+			try {
+				data = await this.app.vault.readBinary(file);
+			} catch (e) {
+				console.warn("[mayaspace] vault.readBinary failed", path, e);
+				return;
+			}
+			const b64 = bytesToBase64(data);
+			if (this.selfWriteHashes.get(path) === hashContent(b64)) return; // 자기 쓰기 echo
+			if (data.byteLength > MAX_IMAGE_BYTES) {
+				new Notice("MayaSpace: 이미지가 20MiB를 초과해 동기화하지 않습니다.");
+				return;
+			}
+			try {
+				const { etag } = await this.api.readFileBinary(mapping.orgId, mapping.fileId);
+				await this.api.writeFileBinary(mapping.orgId, mapping.fileId, data, etag);
+				this.selfWriteHashes.set(path, hashContent(b64));
+				console.log("[mayaspace] image modify pushed via REST", path);
+			} catch (e) {
+				console.warn("[mayaspace] image modify push failed", path, e);
+			}
+			return;
+		}
+
 		let content: string;
 		try {
 			content = await this.app.vault.read(file);
