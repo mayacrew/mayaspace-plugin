@@ -1057,9 +1057,22 @@ export default class MayaspacePlugin extends Plugin {
 			const file = this.app.vault.getAbstractFileByPath(path);
 			if (file instanceof TFile) {
 				try {
-					const body = await this.app.vault.read(file);
-					if (body && body.length > 0) {
-						contentBase64 = utf8ToBase64(body);
+					if (isImagePath(path)) {
+						// 이미지: 텍스트 read는 바이트를 깨뜨린다. readBinary→base64.
+						const data = await this.app.vault.readBinary(file);
+						if (data.byteLength > MAX_IMAGE_BYTES) {
+							new Notice("MayaSpace: 이미지가 20MiB를 초과해 업로드하지 않습니다. (로컬에는 남아 있음)");
+							return;
+						}
+						contentBase64 = bytesToBase64(data);
+						// OS가 createBinary 직후 modify를 추가 발화해도 같은 바이트면
+						// handleVaultModify 이미지 분기가 echo로 인식해 재업로드하지 않는다.
+						this.selfWriteHashes.set(path, hashContent(contentBase64));
+					} else {
+						const body = await this.app.vault.read(file);
+						if (body && body.length > 0) {
+							contentBase64 = utf8ToBase64(body);
+						}
 					}
 				} catch (e) {
 					console.warn("[mayaspace] reading new file body for upload", path, e);
