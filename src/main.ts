@@ -41,6 +41,7 @@ import { CollabSidebarView, VIEW_TYPE_COLLAB, type CollabSidebarCallbacks } from
 
 import { parseMayaspacePath, sanitizeFolderName, canonicalServerPath } from "./lib/path";
 import { READ, UPDATE, CREATE, DELETE, can } from "./lib/permissions";
+import { isImagePath, bytesToBase64, MAX_IMAGE_BYTES, makeRand4, decideImageDrop } from "./lib/attachments";
 import { checkCreate, checkUpdate, checkDelete, checkMove } from "./permissions/permission-guard";
 import { EditorView } from "@codemirror/view";
 
@@ -586,6 +587,16 @@ export default class MayaspacePlugin extends Plugin {
 		try {
 			const file = this.app.vault.getAbstractFileByPath(path);
 			if (!(file instanceof TFile)) return;
+			// 이미지: 텍스트 read/modify를 타면 바이트가 깨진다. 빈 placeholder만
+			// 바이너리로 채우고, 비어있지 않으면 (텍스트 경로와 같은 원칙으로) 덮지 않는다.
+			if (isImagePath(path)) {
+				if (file.stat.size > 0) return;
+				const { data } = await this.api.readFileBinary(mapping.orgId, mapping.fileId);
+				if (data.byteLength === 0) return;
+				this.selfWriteHashes.set(path, hashContent(bytesToBase64(data)));
+				await this.app.vault.modifyBinary(file, data);
+				return;
+			}
 			const current = await this.app.vault.read(file);
 			// vault에 사용자 편집(또는 이전 세션의 본문)이 있으면 덮어쓰지 않는다.
 			// 사용자가 오프라인으로 작성한 내용이 옛 서버 본문에 의해 사라지는 케이스를 막는다.
@@ -670,6 +681,8 @@ export default class MayaspacePlugin extends Plugin {
 	}
 
 	private async startPrefetch(path: string, mapping: FileMapping): Promise<void> {
+		// 이미지는 Yjs(텍스트 전용) 대상이 아니다 — 세션을 열면 garbage ytext가 생긴다.
+		if (isImagePath(path)) return;
 		if (this.prefetches.has(path)) return;
 		// Capture the sync instance we open with. On server-URL change
 		// rebuildBackendClients() swaps this.sync for a new instance; cleanup
