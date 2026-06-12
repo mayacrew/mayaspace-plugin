@@ -8,6 +8,7 @@ function jsonResponse(status: number, body: unknown, extraHeaders: Record<string
 		ok: status >= 200 && status < 300,
 		text: async () => JSON.stringify(body),
 		json: async <T>() => body as T,
+		arrayBuffer: async () => new ArrayBuffer(0),
 		headers: { "content-type": "application/json", ...extraHeaders },
 	};
 }
@@ -18,6 +19,7 @@ function textResponse(status: number, body: string, extraHeaders: Record<string,
 		ok: status >= 200 && status < 300,
 		text: async () => body,
 		json: async <T>() => body as unknown as T,
+		arrayBuffer: async () => new ArrayBuffer(0),
 		headers: { "content-type": "text/markdown", ...extraHeaders },
 	};
 }
@@ -225,5 +227,44 @@ describe("MayaspaceApi", () => {
 		const caps = await api.capabilities();
 		expect((caps as any).features.hocuspocus).toBe(true);
 		expect(calls[0].url).toBe("https://api.test/v1/capabilities");
+	});
+
+	test("readFileBinary: arrayBuffer와 etag를 돌려준다 (text() 미호출)", async () => {
+		const { auth } = await authedAuth();
+		const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]).buffer;
+		const fetcher: Fetcher = async (req) => {
+			expect(req.method).toBe("GET");
+			expect(req.url).toBe("https://api.test/v1/orgs/o1/files/f1");
+			return {
+				status: 200,
+				ok: true,
+				text: async () => { throw new Error("binary path must not call text()"); },
+				json: async () => { throw new Error("binary path must not call json()"); },
+				arrayBuffer: async () => bytes,
+				headers: { etag: "e-77" },
+			};
+		};
+		const api = new MayaspaceApi("https://api.test", auth, fetcher);
+
+		const { data, etag } = await api.readFileBinary("o1", "f1");
+		expect(etag).toBe("e-77");
+		expect(new Uint8Array(data)[0]).toBe(0x89);
+	});
+
+	test("writeFileBinary: raw ArrayBuffer 본문 + If-Match 전송", async () => {
+		const { auth } = await authedAuth();
+		const payload = new Uint8Array([1, 2, 3]).buffer;
+		const calls: HttpRequest[] = [];
+		const fetcher: Fetcher = async (req) => {
+			calls.push(req);
+			return jsonResponse(200, { etag: "e-78" });
+		};
+		const api = new MayaspaceApi("https://api.test", auth, fetcher);
+
+		const { etag } = await api.writeFileBinary("o1", "f1", payload, "e-77");
+		expect(etag).toBe("e-78");
+		expect(calls[0].headers["If-Match"]).toBe("e-77");
+		expect(calls[0].headers["Content-Type"]).toBe("application/octet-stream");
+		expect(calls[0].body).toBe(payload); // 문자열 변환 없이 그대로
 	});
 });

@@ -28,6 +28,7 @@ async function authedAuth(): Promise<MayaspaceAuth> {
 	return new MayaspaceAuth("https://api.test", async () => ({
 		status: 200, ok: true,
 		text: async () => "{}", json: async <T>() => ({} as T),
+		arrayBuffer: async () => new ArrayBuffer(0),
 		headers: {},
 	}), storage);
 }

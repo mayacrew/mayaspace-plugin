@@ -10,6 +10,7 @@ function jsonResponse(status: number, body: unknown, extraHeaders: Record<string
 		ok: status >= 200 && status < 300,
 		text: async () => JSON.stringify(body),
 		json: async <T>() => body as T,
+		arrayBuffer: async () => new ArrayBuffer(0),
 		headers: { "content-type": "application/json", ...extraHeaders },
 	};
 }

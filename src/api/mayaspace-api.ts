@@ -115,6 +115,22 @@ export class MayaspaceApi {
 		const parsed = body as { etag?: string } | null;
 		return { etag: parsed?.etag ?? "" };
 	}
+	/** 이미지 등 바이너리 본문 읽기. text()를 타면 바이트가 깨지므로 전용 경로를 쓴다. */
+	async readFileBinary(orgId: string, fileId: string): Promise<{ data: ArrayBuffer; etag: string }> {
+		const { res, body } = await this.rawRequest("GET", `/v1/orgs/${enc(orgId)}/files/${enc(fileId)}`, {
+			extraHeaders: { Accept: "*/*" },
+			binaryResponse: true,
+		});
+		return { data: body as ArrayBuffer, etag: res.headers["etag"] ?? "" };
+	}
+	async writeFileBinary(orgId: string, fileId: string, data: ArrayBuffer, etag: string): Promise<{ etag: string }> {
+		const { body } = await this.rawRequest("PUT", `/v1/orgs/${enc(orgId)}/files/${enc(fileId)}`, {
+			rawBody: data,
+			extraHeaders: { "If-Match": etag, "Content-Type": "application/octet-stream" },
+		});
+		const parsed = body as { etag?: string } | null;
+		return { etag: parsed?.etag ?? "" };
+	}
 	async deleteFile(orgId: string, fileId: string): Promise<void> {
 		await this.request<void>("DELETE", `/v1/orgs/${enc(orgId)}/files/${enc(fileId)}`);
 	}
@@ -208,8 +224,9 @@ export class MayaspaceApi {
 		path: string,
 		opts?: {
 			body?: unknown;
-			rawBody?: string;
+			rawBody?: string | ArrayBuffer;
 			rawResponse?: boolean;
+			binaryResponse?: boolean;
 			extraHeaders?: Record<string, string>;
 		},
 	): Promise<{ res: HttpResponse; body: unknown }> {
@@ -249,6 +266,9 @@ export class MayaspaceApi {
 			throw new Error(`${method} ${path} failed: ${res.status} ${errText}`);
 		}
 
+		if (opts?.binaryResponse) {
+			return { res, body: await res.arrayBuffer() };
+		}
 		const text = await res.text();
 		if (opts?.rawResponse) {
 			return { res, body: text };

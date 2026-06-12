@@ -9,7 +9,7 @@ export interface HttpRequest {
 	method: string;
 	url: string;
 	headers: Record<string, string>;
-	body?: string;
+	body?: string | ArrayBuffer;
 	signal?: AbortSignal;
 }
 
@@ -18,6 +18,7 @@ export interface HttpResponse {
 	ok: boolean;
 	text(): Promise<string>;
 	json<T = unknown>(): Promise<T>;
+	arrayBuffer(): Promise<ArrayBuffer>;
 	headers: Record<string, string>;
 }
 
@@ -37,6 +38,7 @@ export const fetchAdapter: Fetcher = async (req) => {
 		ok: res.ok,
 		text: () => res.text(),
 		json: <T>() => res.json() as Promise<T>,
+		arrayBuffer: () => res.arrayBuffer(),
 		headers,
 	};
 };
@@ -49,9 +51,9 @@ export function makeObsidianFetcher(requestUrl: (opts: {
 	url: string;
 	method: string;
 	headers: Record<string, string>;
-	body?: string;
+	body?: string | ArrayBuffer;
 	throw?: boolean;
-}) => Promise<{ status: number; text: string; json: any; headers: Record<string, string> }>): Fetcher {
+}) => Promise<{ status: number; text: string; json: any; arrayBuffer: ArrayBuffer; headers: Record<string, string> }>): Fetcher {
 	return async (req) => {
 		const res = await requestUrl({
 			url: req.url,
@@ -69,6 +71,7 @@ export function makeObsidianFetcher(requestUrl: (opts: {
 			ok: res.status >= 200 && res.status < 300,
 			text: async () => res.text,
 			json: async <T>() => res.json as T,
+			arrayBuffer: async () => res.arrayBuffer,
 			headers,
 		};
 	};
