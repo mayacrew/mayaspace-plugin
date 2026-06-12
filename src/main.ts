@@ -9,7 +9,7 @@
  * this file is glue.
  */
 
-import { MarkdownView, Notice, Plugin, TFile, requestUrl } from "obsidian";
+import { Editor, MarkdownView, Notice, Plugin, TFile, requestUrl } from "obsidian";
 
 import {
 	MayaspaceSettings,
@@ -437,6 +437,22 @@ export default class MayaspacePlugin extends Plugin {
 			this.app.vault.on("modify", (f) => {
 				if (!(f instanceof TFile)) return;
 				this.handleVaultModify(f.path).catch((e) => console.warn("[mayaspace] modify", e));
+			}),
+		);
+		// 이미지 드롭/붙여넣기: org 폴더 안 노트에서는 vault 루트(Obsidian 기본
+		// 동작) 대신 노트 옆 attachments/에 저장해 폴더 ACL을 상속시킨다.
+		this.registerEvent(
+			this.app.workspace.on("editor-drop", (evt, editor, info) => {
+				if (evt.defaultPrevented) return;
+				const files = Array.from(evt.dataTransfer?.files ?? []);
+				this.handleImageDrop(files, evt, editor, info?.file?.path ?? null);
+			}),
+		);
+		this.registerEvent(
+			this.app.workspace.on("editor-paste", (evt, editor, info) => {
+				if (evt.defaultPrevented) return;
+				const files = Array.from(evt.clipboardData?.files ?? []);
+				this.handleImageDrop(files, evt, editor, info?.file?.path ?? null);
 			}),
 		);
 	}
@@ -1032,6 +1048,61 @@ export default class MayaspacePlugin extends Plugin {
 	}
 
 	// ---------- Vault → server ----------
+
+	/**
+	 * decideImageDrop이 ignore면 Obsidian 기본 동작에 맡긴다. 이미지가 아닌
+	 * 파일이 섞인 혼합 드롭도 ignore — 절반만 가로채면 기본 동작과 충돌한다.
+	 */
+	private handleImageDrop(files: File[], evt: Event, editor: Editor, notePath: string | null): void {
+		if (files.length === 0 || !notePath) return;
+		const parsed = parseMayaspacePath(notePath, this.settings.mayaspaceRoot);
+		const orgId = parsed ? this.settings.orgMappings[parsed.orgName] : undefined;
+		const canCreate = orgId ? checkCreate(this.permsForNewPath(orgId, notePath)).allowed : false;
+
+		const decisions = files.map((f) =>
+			decideImageDrop({
+				notePath,
+				inOrgFolder: !!orgId,
+				canCreate,
+				fileName: f.name,
+				fileSize: f.size,
+				now: new Date(),
+				rand: makeRand4(),
+			}),
+		);
+		if (decisions.some((d) => d.kind === "ignore")) return;
+
+		evt.preventDefault();
+		const actionable = decisions as Array<Exclude<ReturnType<typeof decideImageDrop>, { kind: "ignore" }>>;
+		void this.saveDroppedImages(files, actionable, editor);
+	}
+
+	private async saveDroppedImages(
+		files: File[],
+		decisions: Array<{ kind: "block"; message: string } | { kind: "save"; folder: string; vaultPath: string; linkText: string }>,
+		editor: Editor,
+	): Promise<void> {
+		for (let i = 0; i < files.length; i++) {
+			const d = decisions[i];
+			if (d.kind === "block") {
+				new Notice(d.message);
+				continue;
+			}
+			try {
+				const data = await files[i].arrayBuffer();
+				if (!(await this.app.vault.adapter.exists(d.folder))) {
+					await this.app.vault.createFolder(d.folder);
+				}
+				// createBinary가 vault.on('create')를 발화 → handleVaultCreate의
+				// 이미지 분기가 서버 업로드까지 처리한다 (여기서 업로드하지 않는다).
+				await this.app.vault.createBinary(d.vaultPath, data);
+				editor.replaceSelection(d.linkText + "\n");
+			} catch (e) {
+				console.warn("[mayaspace] image drop save failed", d.vaultPath, e);
+				new Notice("MayaSpace: 이미지 저장에 실패했습니다.");
+			}
+		}
+	}
 
 	private async handleVaultCreate(path: string): Promise<void> {
 		if (this.mappings.getFile(path)) return; // our own placeholder
