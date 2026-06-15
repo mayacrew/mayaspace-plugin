@@ -14,26 +14,30 @@
 	color: var(--text-normal);
 }
 
-/* Live-collab connection status */
-.mayaspace-status-syncing .nav-file-title-content::after {
+/* Live-collab connection status (file rows + aggregated folder rows) */
+.mayaspace-status-syncing .nav-file-title-content::after,
+.mayaspace-status-syncing .nav-folder-title-content::after {
 	content: " …";
 	color: var(--text-muted);
 	font-size: 0.9em;
 }
 
-.mayaspace-status-connected .nav-file-title-content::after {
+.mayaspace-status-connected .nav-file-title-content::after,
+.mayaspace-status-connected .nav-folder-title-content::after {
 	content: " ●";
 	color: var(--color-green);
 	font-size: 0.7em;
 }
 
-.mayaspace-status-offline .nav-file-title-content::after {
+.mayaspace-status-offline .nav-file-title-content::after,
+.mayaspace-status-offline .nav-folder-title-content::after {
 	content: " ○";
 	color: var(--text-muted);
 	font-size: 0.7em;
 }
 
-.mayaspace-status-conflict .nav-file-title-content::after {
+.mayaspace-status-conflict .nav-file-title-content::after,
+.mayaspace-status-conflict .nav-folder-title-content::after {
 	content: " !";
 	color: var(--color-red);
 	font-weight: bold;
