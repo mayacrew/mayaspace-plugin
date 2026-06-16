@@ -28,6 +28,8 @@ import { MayaspaceApi, EtagMismatchError, type FileMeta } from "./api/mayaspace-
 import { MayaspaceSync, defaultHocuspocusFactory } from "./sync/mayaspace-sync";
 import { LiveCollabSession } from "./sync/live-collab-session";
 import { bindYCollab } from "./sync/yCollab-binder";
+import { shouldApplyPrefetch } from "./sync/prefetch-policy";
+import { debounce } from "./lib/debounce";
 
 import { syncOrgTrees, type FileMapping } from "./vault/tree-sync";
 import { FileMappings } from "./vault/file-mappings";
@@ -60,6 +62,12 @@ export default class MayaspacePlugin extends Plugin {
 	private events: MayaspaceEvents | null = null;
 	private collabSidebar: CollabSidebarView | null = null;
 	private treePoller: TreePoller | null = null;
+	// 동시 syncTrees 실행 방지 플래그.
+	private syncingTrees = false;
+	// 서버 access.changed 신호 → 권한 즉시 재동기화. 짧게 몰아쳐도 한 번만 돌도록 디바운스.
+	private readonly resyncOnAccessChange = debounce(() => {
+		void this.syncTrees().catch((e) => console.warn("[mayaspace] access.changed resync", e));
+	}, 800);
 	private statusBarItem: HTMLElement | null = null;
 	private fileStatuses: Record<string, SyncStatus> = {};
 	private settingTab: MayaspaceSettingTab | null = null;
@@ -136,11 +144,12 @@ export default class MayaspacePlugin extends Plugin {
 				delete this.fileStatuses[other];
 			}
 			const permsActive = this.permsForFileId(mapping.orgId, mapping.fileId);
-			if (!can(permsActive, UPDATE)) {
-				console.log("[mayaspace] skip live-collab attach: no UPDATE perm", path);
+			if (!can(permsActive, READ)) {
+				console.log("[mayaspace] skip live-collab attach: no READ perm", path);
 				return;
 			}
-			await this.liveCollab.attach(path, mapping).catch((e) =>
+			const readOnly = !can(permsActive, UPDATE);
+			await this.liveCollab.attach(path, mapping, { readOnly }).catch((e) =>
 				console.warn("[mayaspace] attach on layout-ready failed", path, e),
 			);
 		}, 0);
@@ -244,9 +253,9 @@ export default class MayaspacePlugin extends Plugin {
 		this.liveCollab = new LiveCollabSession({
 			api: this.api,
 			sync: this.sync,
-			bindEditor: (view, handle) => {
+			bindEditor: (view, handle, readOnly) => {
 				const identity = makePeerIdentity(this.settings.displayName || null, this.settings.accountEmail);
-				return bindYCollab(view as EditorView, handle, identity);
+				return bindYCollab(view as EditorView, handle, identity, { readOnly: !!readOnly });
 			},
 			findEditorView: (path) => this.findEditorViewForPath(path),
 			dumpContent: async (path, content) => {
@@ -555,6 +564,17 @@ export default class MayaspacePlugin extends Plugin {
 
 	async syncTrees(): Promise<void> {
 		if (!this.settings.tokenSet) return;
+		// 동시 실행 방지: access.changed·startup·로그인·수동 호출이 겹쳐도 한 번만 돈다.
+		if (this.syncingTrees) return;
+		this.syncingTrees = true;
+		try {
+			await this.runTreeSync();
+		} finally {
+			this.syncingTrees = false;
+		}
+	}
+
+	private async runTreeSync(): Promise<void> {
 		const result = await syncOrgTrees(
 			this.app.vault as unknown as Parameters<typeof syncOrgTrees>[0],
 			this.api,
@@ -569,7 +589,7 @@ export default class MayaspacePlugin extends Plugin {
 					this.settings.orgMappings[folderName] = orgId;
 				},
 				onOrgPermissions: (perms) => this.applyOrgPermissions(perms),
-				onFilePermissions: (fileId, perms) => { this.settings.filePermissions[fileId] = perms; },
+				onFilePermissions: (fileId, perms) => this.applyFilePermission(fileId, perms),
 			},
 		);
 		this.settings.orgMappings = result.orgs;
@@ -718,11 +738,11 @@ export default class MayaspacePlugin extends Plugin {
 				if (!(file instanceof TFile)) return;
 				try {
 					const current = await this.app.vault.read(file);
-					if (current === content) return;
-					// vault에 사용자 편집(혹은 stale 본문)이 있고 ytext와 다르면 그대로 둔다.
-					// 옛 IndexedDB ytext가 사용자 편집을 덮어쓰는 race를 막는다.
-					// 사용자가 파일을 열면 yCollab attach 시 CRDT merge로 합쳐진다.
-					if (current.length > 0) return;
+					// writable 파일은 빈 placeholder만 채우고 non-empty는 yCollab attach 머지에
+					// 위임(사용자 편집 보호). read-only 파일은 보호할 편집이 없으니 서버 내용으로
+					// 덮어써 동기화를 유지한다.
+					const writable = can(this.permsForFileId(mapping.orgId, mapping.fileId), UPDATE);
+					if (!shouldApplyPrefetch(current, content, writable)) return;
 					await this.safeModify(file, content);
 				} catch (e) {
 					console.warn("[mayaspace] prefetch flush failed", path, e);
@@ -794,7 +814,7 @@ export default class MayaspacePlugin extends Plugin {
 				// Same diff+detach logic as syncTrees — admin's permission changes
 				// must reach the plugin via the periodic poll, not just on next login.
 				onOrgPermissions: (perms) => this.applyOrgPermissions(perms),
-				onFilePermissions: (fileId, perms) => { this.settings.filePermissions[fileId] = perms; },
+				onFilePermissions: (fileId, perms) => this.applyFilePermission(fileId, perms),
 				onFileLost: (path, mapping) => {
 					this.stopPrefetch(path);
 					if (this.liveCollab.activePaths().includes(path)) {
@@ -833,6 +853,12 @@ export default class MayaspacePlugin extends Plugin {
 					if (m.orgId !== orgId) continue;
 					if (this.liveCollab.activePaths().includes(path)) {
 						await this.liveCollab.detach(path).catch(() => undefined);
+						// 편집권만 잃고 읽기는 유지되면: 로컬 발산(전환 직전 친 편집)을 버리고
+						// 서버에서 재시드해 read-only로 다시 붙인다 → 로컬=서버.
+						if (lostUpdate && !lostRead) {
+							await this.sync.purgeDoc(m.orgId, m.fileId).catch(() => undefined);
+							await this.liveCollab.attach(path, m, { readOnly: true }).catch(() => undefined);
+						}
 					}
 					if (lostRead) {
 						// 읽기 권한이 사라지면 로컬 .md까지 지운다. 씽크파일만 지우면
@@ -868,6 +894,42 @@ export default class MayaspacePlugin extends Plugin {
 				}
 			}
 		}
+	}
+
+	/**
+	 * 파일별 effective_permissions 갱신. write 권한이 사라진 전환(editable→readonly)을
+	 * 감지하면 로컬 발산을 버리고 서버에서 재시드한다 — readonly는 "로컬=서버"여야 한다.
+	 */
+	private applyFilePermission(fileId: string, perms: number): void {
+		const prev = this.settings.filePermissions[fileId];
+		this.settings.filePermissions[fileId] = perms;
+		if (prev !== undefined && can(prev, UPDATE) && !can(perms, UPDATE)) {
+			void this.reseedReadOnly(fileId);
+		}
+	}
+
+	/**
+	 * readonly로 강등된 파일의 로컬 CRDT(IndexedDB)를 비워 전환 직전에 친 로컬 op을 폐기하고,
+	 * 열려 있던 파일은 read-only로 재attach해 서버 본문에서 다시 시드한다. 열려있지 않은 파일은
+	 * 다음 prefetch가 서버 내용으로 .md를 덮어쓴다(shouldApplyPrefetch, writable=false).
+	 */
+	private async reseedReadOnly(fileId: string): Promise<void> {
+		const located = this.locateFileById(fileId);
+		if (!located) return;
+		const { orgId, path } = located;
+		const wasActive = this.liveCollab.activePaths().includes(path);
+		if (wasActive) await this.liveCollab.detach(path).catch(() => undefined);
+		await this.sync.purgeDoc(orgId, fileId).catch(() => undefined);
+		if (wasActive) {
+			await this.liveCollab.attach(path, { orgId, fileId }, { readOnly: true }).catch(() => undefined);
+		}
+	}
+
+	private locateFileById(fileId: string): { orgId: string; path: string } | null {
+		for (const [path, m] of Object.entries(this.settings.fileMappings)) {
+			if (m.fileId === fileId) return { orgId: m.orgId, path };
+		}
+		return null;
 	}
 
 	// ---------- SSE ----------
@@ -1034,6 +1096,8 @@ export default class MayaspacePlugin extends Plugin {
 						this.collabSidebar.onPresenceChanged(p.orgId, p.fileId, p.userIds);
 					}
 				},
+				// 권한 변경 신호: 30초 폴러를 기다리지 않고 즉시(디바운스) 권한 재동기화.
+				onAccessChanged: () => this.resyncOnAccessChange(),
 				onError: (orgId, e) => console.warn("[mayaspace] SSE error", orgId, e),
 			},
 		});
@@ -1394,11 +1458,12 @@ export default class MayaspacePlugin extends Plugin {
 		// we dispatch the new compartment.
 		await new Promise<void>((r) => requestAnimationFrame(() => r()));
 		const perms = this.permsForFileId(mapping.orgId, mapping.fileId);
-		if (!can(perms, UPDATE)) {
-			console.log("[mayaspace] skip live-collab attach: no UPDATE perm", path);
+		if (!can(perms, READ)) {
+			console.log("[mayaspace] skip live-collab attach: no READ perm", path);
 			return;
 		}
-		await this.liveCollab.attach(path, mapping).catch((e) =>
+		const readOnly = !can(perms, UPDATE);
+		await this.liveCollab.attach(path, mapping, { readOnly }).catch((e) =>
 			console.warn("[mayaspace] attach failed", path, e),
 		);
 	}

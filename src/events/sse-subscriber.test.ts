@@ -71,6 +71,17 @@ describe("MayaspaceEvents", () => {
 		expect(onMoved).toHaveBeenCalledWith(expect.objectContaining({ fileId: "f3" }));
 	});
 
+	test("access.changed 이벤트는 onAccessChanged(orgId)로 dispatch된다", async () => {
+		const onAccessChanged = jest.fn();
+		const { events, sources } = make({ onAccessChanged });
+		events.subscribe("org1");
+		await flush();
+
+		sources[0].fire("access.changed", { orgId: "org1" });
+
+		expect(onAccessChanged).toHaveBeenCalledWith("org1");
+	});
+
 	test("자기 deviceId가 발생시킨 이벤트는 거른다", async () => {
 		const onCreated = jest.fn();
 		const { events, sources } = make({ onCreated }, "self");

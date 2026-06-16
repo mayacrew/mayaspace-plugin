@@ -12,7 +12,7 @@
  * IME diagnostic listeners.
  */
 
-import { Compartment, StateEffect } from "@codemirror/state";
+import { Compartment, EditorState, StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { ySync, ySyncFacet, YSyncConfig } from "y-codemirror.next";
 import * as Y from "yjs";
@@ -28,6 +28,7 @@ export function bindYCollab(
 	view: EditorView,
 	handle: YCollabHandle,
 	identity: PeerIdentity,
+	opts: { readOnly?: boolean } = {},
 ): () => void {
 	const compartment = new Compartment();
 	const ytext = handle.doc.getText("content");
@@ -42,7 +43,12 @@ export function bindYCollab(
 	// the index exceeds the editor doc length → RangeError → the ViewPlugin
 	// dies and the client stops applying remote updates (one-sided desync).
 	// Dropping remote-cursor rendering removes the crash; content sync stays.
+	// readOnly: 사용자 키 입력은 막되(editable=false) ySync가 적용하는 원격 업데이트는
+	// 프로그램적 dispatch라 그대로 반영된다 → "쓰기 금지, 서버 내용은 계속 수신".
 	const ext = [ySyncFacet.of(new YSyncConfig(ytext, handle.awareness)), ySync];
+	if (opts.readOnly) {
+		ext.push(EditorState.readOnly.of(true), EditorView.editable.of(false));
+	}
 
 	// Probe whether ytext is recognised as the same Y.Text class our bundle
 	// knows about. If instanceof fails, ySyncPlugin will silently refuse to
@@ -99,7 +105,15 @@ export function bindYCollab(
 	} = {
 		effects: StateEffect.appendConfig.of(compartment.of([ext, syncDiag])),
 	};
-	if (ytextStr.length === 0 && editorStr.length > 0) {
+	if (opts.readOnly) {
+		// read-only: 서버(ytext)가 절대 진실. 로컬 편집은 무시하고 에디터를 ytext로 맞춘다.
+		// editor → ytext 푸시(아래 분기)를 절대 타지 않는다 — readonly 전환 직전 창에서 친
+		// 로컬 발산이 서버/CRDT를 오염시키면 "로컬=서버만"이 깨진다.
+		if (ytextStr !== editorStr) {
+			tx.changes = { from: 0, to: view.state.doc.length, insert: ytextStr };
+			console.log("[mayaspace] reconcile(read-only): ytext → editor (서버가 진실)");
+		}
+	} else if (ytextStr.length === 0 && editorStr.length > 0) {
 		// CRDT-side empty, vault-side has content. Push to ytext as a real
 		// insert (not the editor-doc reset path) so peers and IndexedDB
 		// observe it as a normal CRDT update.
@@ -116,7 +130,8 @@ export function bindYCollab(
 	// Post-attach probe (next microtask): can we push to ytext directly? If
 	// this works but editor → ytext sync still doesn't, the wiring between
 	// yCollab and our compartment is the culprit (not Y.Text identity).
-	queueMicrotask(() => {
+	// read-only는 ytext에 한 글자도 쓰지 않아야 하므로 프로브를 건너뛴다.
+	if (!opts.readOnly) queueMicrotask(() => {
 		const beforeLen = ytext.length;
 		try {
 			ytext.insert(beforeLen, "");

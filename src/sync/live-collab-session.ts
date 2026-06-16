@@ -42,8 +42,12 @@ export interface SyncLike {
 export interface SessionDeps {
 	api: ApiLike;
 	sync: SyncLike;
-	/** Bind yCollab to the editor view. Returns an unbind function. */
-	bindEditor: (view: unknown, handle: ProviderHandleLike) => () => void;
+	/**
+	 * Bind yCollab to the editor view. Returns an unbind function.
+	 * readOnly=true binds the editor non-editable (사용자 입력 차단) while still
+	 * receiving remote updates — used when the user has READ but not UPDATE.
+	 */
+	bindEditor: (view: unknown, handle: ProviderHandleLike, readOnly?: boolean) => () => void;
 	/** Look up the active EditorView for `path` — null if not mounted. */
 	findEditorView: (path: string) => unknown | null;
 	/**
@@ -68,8 +72,12 @@ export class LiveCollabSession {
 
 	constructor(private deps: SessionDeps) {}
 
-	async attach(path: string, mapping: { orgId: string; fileId: string }): Promise<void> {
-		console.log("[mayaspace] attach()", path, "fileId=", mapping.fileId);
+	async attach(
+		path: string,
+		mapping: { orgId: string; fileId: string },
+		opts: { readOnly?: boolean } = {},
+	): Promise<void> {
+		console.log("[mayaspace] attach()", path, "fileId=", mapping.fileId, "readOnly=", !!opts.readOnly);
 		if (this.active.has(path)) {
 			console.log("[mayaspace] attach() skip — already active", path);
 			return;
@@ -77,12 +85,16 @@ export class LiveCollabSession {
 		const inflight = this.pending.get(path);
 		if (inflight) return inflight;
 
-		const p = this.doAttach(path, mapping).finally(() => this.pending.delete(path));
+		const p = this.doAttach(path, mapping, opts).finally(() => this.pending.delete(path));
 		this.pending.set(path, p);
 		return p;
 	}
 
-	private async doAttach(path: string, mapping: { orgId: string; fileId: string }): Promise<void> {
+	private async doAttach(
+		path: string,
+		mapping: { orgId: string; fileId: string },
+		opts: { readOnly?: boolean },
+	): Promise<void> {
 		// ytext is the ground truth. The server seeds it from the .yjs binary or
 		// from the markdown body on first open; we let yCollab render it to the
 		// editor instead of overwriting the placeholder via vault.modify (which
@@ -105,7 +117,7 @@ export class LiveCollabSession {
 		let unbind: (() => void) | null = null;
 		const view = this.deps.findEditorView(path);
 		if (view) {
-			unbind = this.deps.bindEditor(view, handle);
+			unbind = this.deps.bindEditor(view, handle, opts.readOnly ?? false);
 		}
 
 		this.active.set(path, {

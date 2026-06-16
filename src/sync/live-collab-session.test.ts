@@ -142,6 +142,46 @@ describe("LiveCollabSession", () => {
 		expect(session.activePaths()).toEqual([]);
 	});
 
+	test("attach: readOnly 옵션을 bindEditor의 3번째 인자로 전달한다", async () => {
+		const doc = new Y.Doc();
+		const bindArgs: unknown[][] = [];
+		const session = new LiveCollabSession({
+			api: { readFile: async () => ({ content: "" }) },
+			sync: {
+				openDoc: async () => ({ doc, awareness: {}, destroy: () => {} }),
+				closeDoc: async () => {},
+				onPermissionLost: () => () => {},
+			},
+			bindEditor: (...args: unknown[]) => { bindArgs.push(args); return () => {}; },
+			findEditorView: () => ({}),
+		});
+
+		await session.attach("p.md", { orgId: "o1", fileId: "f1" }, { readOnly: true });
+
+		expect(bindArgs).toHaveLength(1);
+		expect(bindArgs[0][2]).toBe(true);
+	});
+
+	test("attach: 옵션이 없으면 readOnly는 false로 전달된다", async () => {
+		const doc = new Y.Doc();
+		const bindArgs: unknown[][] = [];
+		const session = new LiveCollabSession({
+			api: { readFile: async () => ({ content: "" }) },
+			sync: {
+				openDoc: async () => ({ doc, awareness: {}, destroy: () => {} }),
+				closeDoc: async () => {},
+				onPermissionLost: () => () => {},
+			},
+			bindEditor: (...args: unknown[]) => { bindArgs.push(args); return () => {}; },
+			findEditorView: () => ({}),
+		});
+
+		await session.attach("p.md", { orgId: "o1", fileId: "f1" });
+
+		expect(bindArgs).toHaveLength(1);
+		expect(bindArgs[0][2]).toBe(false);
+	});
+
 	test("activePaths는 현재 active 세션의 path 배열을 반환한다", async () => {
 		const { deps } = makeDeps();
 		const session = new LiveCollabSession(deps);

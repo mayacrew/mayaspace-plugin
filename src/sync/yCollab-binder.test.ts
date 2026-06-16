@@ -165,6 +165,86 @@ describe("bindYCollab — live sync after attach", () => {
 	});
 });
 
+describe("bindYCollab — read-only mode", () => {
+	test("readOnly:true 면 에디터가 read-only로 설정된다 (사용자 입력 차단)", () => {
+		const view = makeView("서버 본문");
+		const doc = new Y.Doc();
+		doc.getText("content").insert(0, "서버 본문");
+		const awareness = new Awareness(doc);
+
+		const unbind = bindYCollab(view, { doc, awareness }, makeIdentity(), { readOnly: true });
+
+		expect(view.state.readOnly).toBe(true);
+		expect(view.state.facet(EditorView.editable)).toBe(false);
+
+		unbind();
+		view.destroy();
+	});
+
+	test("readOnly:true 여도 원격 ytext 변경은 계속 에디터에 반영된다 (읽기 동기화 유지)", async () => {
+		const view = makeView("");
+		const doc = new Y.Doc();
+		const awareness = new Awareness(doc);
+
+		const unbind = bindYCollab(view, { doc, awareness }, makeIdentity(), { readOnly: true });
+
+		// 서버에서 온 원격 업데이트(Hocuspocus가 ytext에 적용하는 것과 동일).
+		doc.getText("content").insert(0, "원격에서 도착");
+		await Promise.resolve();
+
+		expect(view.state.doc.toString()).toBe("원격에서 도착");
+
+		unbind();
+		view.destroy();
+	});
+
+	test("readOnly:true + 서버(ytext) 비어있고 에디터에 로컬 편집 → ytext로 밀어넣지 않고 에디터를 비운다 (서버가 진실)", () => {
+		// readonly 전환 직전 창에서 사용자가 친 로컬 내용. read-only면 서버 문서만 남아야 하므로
+		// 로컬은 ytext로 올라가서도 안 되고(서버 오염), 에디터에도 남아서도 안 된다.
+		const view = makeView("readonly인데 친 로컬 내용");
+		const doc = new Y.Doc(); // ytext 비어있음 = 서버 문서 비어있음
+		const awareness = new Awareness(doc);
+
+		const unbind = bindYCollab(view, { doc, awareness }, makeIdentity(), { readOnly: true });
+
+		expect(doc.getText("content").toString()).toBe("");
+		expect(view.state.doc.toString()).toBe("");
+
+		unbind();
+		view.destroy();
+	});
+
+	test("readOnly:true + 서버/로컬이 다름 → 에디터를 서버 내용으로 리셋하고 로컬은 버린다", () => {
+		const view = makeView("로컬 편집본");
+		const doc = new Y.Doc();
+		doc.getText("content").insert(0, "서버 본문");
+		const awareness = new Awareness(doc);
+
+		const unbind = bindYCollab(view, { doc, awareness }, makeIdentity(), { readOnly: true });
+
+		expect(view.state.doc.toString()).toBe("서버 본문");
+		expect(doc.getText("content").toString()).toBe("서버 본문");
+
+		unbind();
+		view.destroy();
+	});
+
+	test("옵션 없으면(기본) 에디터는 편집 가능 상태를 유지한다 (회귀 방지)", () => {
+		const view = makeView("본문");
+		const doc = new Y.Doc();
+		doc.getText("content").insert(0, "본문");
+		const awareness = new Awareness(doc);
+
+		const unbind = bindYCollab(view, { doc, awareness }, makeIdentity());
+
+		expect(view.state.readOnly).toBe(false);
+		expect(view.state.facet(EditorView.editable)).toBe(true);
+
+		unbind();
+		view.destroy();
+	});
+});
+
 describe("bindYCollab — unbind cleanup", () => {
 	test("calling unbind() doesn't throw and leaves editor usable", () => {
 		const view = makeView("base");
