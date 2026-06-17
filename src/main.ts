@@ -30,6 +30,7 @@ import { LiveCollabSession } from "./sync/live-collab-session";
 import { bindYCollab } from "./sync/yCollab-binder";
 import { shouldApplyPrefetch } from "./sync/prefetch-policy";
 import { debounce } from "./lib/debounce";
+import { mergeDiskIntoYtext } from "./lib/merge-disk-into-ytext";
 
 import { syncOrgTrees, findUnmappedLocalFiles, type FileMapping, type SyncResult } from "./vault/tree-sync";
 import { FileMappings } from "./vault/file-mappings";
@@ -46,6 +47,12 @@ import { READ, UPDATE, CREATE, DELETE, can } from "./lib/permissions";
 import { isImagePath, bytesToBase64, MAX_IMAGE_BYTES, makeRand4, decideImageDrop } from "./lib/attachments";
 import { checkCreate, checkUpdate, checkDelete, checkMove } from "./permissions/permission-guard";
 import { EditorView } from "@codemirror/view";
+
+// Minimal structural view of a Y.Doc holding the "content" Y.Text. The real
+// yjs types live behind the provider handle (`any`); this keeps the modify
+// merge path typed without dragging the full yjs surface in.
+type YText = { toString(): string; delete(index: number, length: number): void; insert(index: number, text: string): void };
+type YDocWithText = { transact(fn: () => void): void; getText(name: string): YText };
 
 export default class MayaspacePlugin extends Plugin {
 	settings!: MayaspaceSettings;
@@ -1300,12 +1307,6 @@ export default class MayaspacePlugin extends Plugin {
 			new Notice(g.message!);
 			return;
 		}
-		// While a live editor session is open, yCollab/Hocuspocus owns the
-		// content. Any external write here would race with ytext updates.
-		// Obsidian rarely fires modify for the active editor's own keystrokes
-		// (those go through CM6), so this skip is safe.
-		if (this.liveCollab.activePaths().includes(path)) return;
-
 		const file = this.app.vault.getAbstractFileByPath(path);
 		if (!(file instanceof TFile)) return;
 
@@ -1348,26 +1349,34 @@ export default class MayaspacePlugin extends Plugin {
 		// ignore it instead of re-pushing. The OS watcher can fire modify twice
 		// for one write, so we keep the recorded hash (don't delete it here):
 		// both echoes match and stay suppressed. An external edit lands with a
-		// different hash and falls through to the push below.
+		// different hash and falls through to the merge below. This guard runs
+		// BEFORE both the live and prefetch branches, so our own dumps (detach /
+		// prefetch flush via safeModify) never loop back into ytext.
 		if (this.selfWriteHashes.get(path) === hashContent(content)) return;
 
-		// If a Hocuspocus session is open for this file (prefetch keeps one
-		// per mapping), push through ytext so the change broadcasts to every
-		// other connected client in real time. The server REST PUT path is
-		// also blocked while a Hocuspocus session is active — only the WS
-		// route works in that state.
+		// A live editor session is open: merge the external disk write into the
+		// SAME Y.Doc yCollab is bound to. The change then renders in the open
+		// editor and broadcasts to every peer. Earlier we skipped entirely here,
+		// silently losing the disk change (A2). We do NOT open a separate
+		// session for this path — that would seed a second Y.Doc and diverge.
+		const liveHandle = this.liveCollab.handleFor(path);
+		if (liveHandle) {
+			const ytext = (liveHandle.doc as YDocWithText).getText("content");
+			const changed = mergeDiskIntoYtext(liveHandle.doc as YDocWithText, ytext, content);
+			if (changed) console.log("[mayaspace] external modify merged into live ytext", path);
+			return;
+		}
+
+		// No live editor, but a Hocuspocus session may be open via prefetch.
+		// Push through ytext so the change broadcasts to every connected client
+		// in real time. The server REST PUT path is blocked while a Hocuspocus
+		// session is active — only the WS route works in that state.
 		try {
 			const handle = await this.sync.openDoc(mapping.orgId, mapping.fileId);
 			try {
-				const ytext = (handle.doc as { getText(name: string): { toString(): string; delete(idx: number, len: number): void; insert(idx: number, text: string): void } }).getText("content");
-				if (ytext.toString() === content) return; // already in sync
-				// Replace whole ytext content. Wrapped in a transaction so all
-				// peers observe a single coherent update.
-				(handle.doc as { transact(fn: () => void): void }).transact(() => {
-					ytext.delete(0, ytext.toString().length);
-					ytext.insert(0, content);
-				});
-				console.log("[mayaspace] external modify pushed via ytext", path);
+				const ytext = (handle.doc as YDocWithText).getText("content");
+				const changed = mergeDiskIntoYtext(handle.doc as YDocWithText, ytext, content);
+				if (changed) console.log("[mayaspace] external modify pushed via ytext", path);
 			} finally {
 				// closeDoc just decrements the refcount; prefetch keeps the
 				// session alive if it was holding a ref.

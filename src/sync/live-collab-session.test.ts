@@ -182,6 +182,21 @@ describe("LiveCollabSession", () => {
 		expect(bindArgs[0][2]).toBe(false);
 	});
 
+	test("handleFor: active 세션의 provider handle을 반환한다(없으면 null)", async () => {
+		const { deps } = makeDeps();
+		const session = new LiveCollabSession(deps);
+
+		expect(session.handleFor("MayaSpace/dev/a.md")).toBeNull();
+
+		await session.attach("MayaSpace/dev/a.md", { orgId: "o1", fileId: "f1" });
+		const handle = session.handleFor("MayaSpace/dev/a.md");
+		expect(handle).not.toBeNull();
+		expect(handle!.doc.getText("content").toString()).toBe("server-content");
+
+		await session.detach("MayaSpace/dev/a.md");
+		expect(session.handleFor("MayaSpace/dev/a.md")).toBeNull();
+	});
+
 	test("activePaths는 현재 active 세션의 path 배열을 반환한다", async () => {
 		const { deps } = makeDeps();
 		const session = new LiveCollabSession(deps);

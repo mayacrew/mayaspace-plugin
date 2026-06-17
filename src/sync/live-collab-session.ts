@@ -211,6 +211,16 @@ export class LiveCollabSession {
 		return Array.from(this.active.keys());
 	}
 
+	/**
+	 * The live provider handle for `path` — null if no session is active.
+	 * Lets the vault-modify handler merge an external disk write into the
+	 * SAME Y.Doc yCollab is bound to (so it reaches the editor + peers),
+	 * instead of skipping the change.
+	 */
+	handleFor(path: string): ProviderHandleLike | null {
+		return this.active.get(path)?.handle ?? null;
+	}
+
 	pathFor(orgId: string, fileId: string): string | null {
 		for (const [path, entry] of this.active) {
 			if (entry.orgId === orgId && entry.fileId === fileId) return path;
