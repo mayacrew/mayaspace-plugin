@@ -98,6 +98,38 @@ export async function syncOrgTrees(
 	return result;
 }
 
+/**
+ * 로컬에만 있고 서버/매핑에 없는 파일 = 누락된 create 이벤트로 고아가 된 파일.
+ * org 폴더(<root>/<orgFolder>/) 안의 것만 업로드 후보로 돌려준다(순수 함수).
+ *
+ * NFC로 정규화해 비교한다 — macOS는 한글 파일명을 NFD로 다루는데, 서버 경로(NFC)와
+ * byte 비교하면 같은 파일이 고아로 잘못 잡혀 재업로드(409)가 반복된다.
+ *
+ * @param localFiles 모든 로컬 파일의 vault 경로
+ * @param knownPaths 서버 트리 + 기존 매핑에 이미 있는 경로(정상 동기화된 것)
+ * @param orgFolders sanitized org 폴더 이름들
+ * @returns 업로드해야 할 고아 파일들(원본 경로 그대로 — 호출부가 vault API에 쓴다)
+ */
+export function findUnmappedLocalFiles(
+	localFiles: string[],
+	knownPaths: Iterable<string>,
+	mayaspaceRoot: string,
+	orgFolders: Iterable<string>,
+): string[] {
+	const known = new Set<string>();
+	for (const p of knownPaths) known.add(p.normalize("NFC"));
+	const orgPrefixes = Array.from(orgFolders, (f) => `${mayaspaceRoot}/${f}/`.normalize("NFC"));
+
+	const out: string[] = [];
+	for (const path of localFiles) {
+		const nfc = path.normalize("NFC");
+		if (known.has(nfc)) continue;
+		if (!orgPrefixes.some((prefix) => nfc.startsWith(prefix))) continue;
+		out.push(path);
+	}
+	return out;
+}
+
 async function ensureFolder(vault: VaultLike, path: string): Promise<void> {
 	if (vault.getAbstractFileByPath(path)) return;
 	try {

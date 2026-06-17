@@ -31,7 +31,7 @@ import { bindYCollab } from "./sync/yCollab-binder";
 import { shouldApplyPrefetch } from "./sync/prefetch-policy";
 import { debounce } from "./lib/debounce";
 
-import { syncOrgTrees, type FileMapping } from "./vault/tree-sync";
+import { syncOrgTrees, findUnmappedLocalFiles, type FileMapping, type SyncResult } from "./vault/tree-sync";
 import { FileMappings } from "./vault/file-mappings";
 import { TreePoller, type PollerVault } from "./vault/tree-poller";
 
@@ -595,6 +595,8 @@ export default class MayaspacePlugin extends Plugin {
 		this.settings.orgMappings = result.orgs;
 		this.settings.fileMappings = result.files;
 		await this.saveSettings();
+		// 누락된 create 이벤트로 매핑 없이 남은 org 폴더 내 로컬 파일을 서버로 업로드(자가복구).
+		await this.reconcileLocalOrphans(result);
 		this.decorator.refresh();
 		// Eager content cache: pull each file's body into the vault so Obsidian
 		// search / graph / backlinks work without opening the file. Skip files
@@ -604,6 +606,33 @@ export default class MayaspacePlugin extends Plugin {
 		// so remote edits stream into vault.md immediately, not only after
 		// the server's storeDocument debounce.
 		await this.startPrefetchAll();
+	}
+
+	/**
+	 * org 폴더 안에 있는데 매핑(=서버)에 없는 로컬 파일을 서버로 업로드한다.
+	 * create 이벤트가 누락돼(생성 burst·플러그인 리로드) 고아가 된 파일을 자가복구한다.
+	 * markdown만 대상(첨부는 비범위). 권한 없는 파일은 조용히 건너뛴다(폴링마다 Notice 방지).
+	 */
+	private async reconcileLocalOrphans(synced: SyncResult): Promise<void> {
+		const localFiles = this.app.vault.getMarkdownFiles().map((f) => f.path);
+		const orphans = findUnmappedLocalFiles(
+			localFiles,
+			Object.keys(synced.files),
+			this.settings.mayaspaceRoot,
+			Object.keys(synced.orgs),
+		);
+
+		for (const path of orphans) {
+			const parsed = parseMayaspacePath(path, this.settings.mayaspaceRoot);
+			if (!parsed) continue;
+			const orgId = this.settings.orgMappings[parsed.orgName];
+			if (!orgId) continue;
+			if (!checkCreate(this.permsForNewPath(orgId, path)).allowed) continue;
+			console.log("[mayaspace] reconcile: uploading orphaned local file", path);
+			await this.handleVaultCreate(path).catch((e) =>
+				console.warn("[mayaspace] reconcile upload failed", path, e),
+			);
+		}
 	}
 
 	private async hydrateAllPlaceholders(): Promise<void> {

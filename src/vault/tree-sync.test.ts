@@ -1,4 +1,4 @@
-import { syncOrgTrees, type VaultLike, type ApiLike } from "./tree-sync";
+import { syncOrgTrees, findUnmappedLocalFiles, type VaultLike, type ApiLike } from "./tree-sync";
 
 function makeVault() {
 	const existing = new Set<string>();
@@ -218,5 +218,42 @@ describe("syncOrgTrees — onOrgPermissions", () => {
 			onOrgPermissions,
 		});
 		expect(onOrgPermissions).toHaveBeenCalledWith({ "org-c": 0 });
+	});
+});
+
+describe("findUnmappedLocalFiles", () => {
+	const root = "MayaSpace";
+	const orgFolders = ["new-org", "kazan"];
+
+	test("org 폴더 안의 매핑 안 된 로컬 파일을 반환한다", () => {
+		const local = ["MayaSpace/new-org/zerosugar/제로슈가.md"];
+		const known = ["MayaSpace/new-org/zerosugar/333.md"];
+		expect(findUnmappedLocalFiles(local, known, root, orgFolders)).toEqual([
+			"MayaSpace/new-org/zerosugar/제로슈가.md",
+		]);
+	});
+
+	test("이미 알려진(서버/매핑) 파일은 제외한다", () => {
+		const p = "MayaSpace/new-org/zerosugar/333.md";
+		expect(findUnmappedLocalFiles([p], [p], root, orgFolders)).toEqual([]);
+	});
+
+	test("org 폴더 밖의 파일은 제외한다", () => {
+		const local = [
+			"Collectives/dev-test/test.md", // 다른 트리
+			"MayaSpace/strayfile.md", // root 바로 아래(org 폴더 아님)
+			"아이작 뉴턴.md", // vault 루트
+		];
+		expect(findUnmappedLocalFiles(local, [], root, orgFolders)).toEqual([]);
+	});
+
+	test("NFD 로컬과 NFC known이 같은 파일이면 제외한다(정규화 매칭)", () => {
+		const nfd = "MayaSpace/new-org/zero/케도도.md".normalize("NFD");
+		const nfc = "MayaSpace/new-org/zero/케도도.md".normalize("NFC");
+		expect(findUnmappedLocalFiles([nfd], [nfc], root, orgFolders)).toEqual([]);
+	});
+
+	test("입력이 비면 빈 배열", () => {
+		expect(findUnmappedLocalFiles([], [], root, orgFolders)).toEqual([]);
 	});
 });
