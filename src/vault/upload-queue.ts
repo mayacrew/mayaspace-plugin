@@ -1,5 +1,7 @@
 /**
- * 벌크 업로드용 바운디드 큐.
+ * 벌크 파일 작업용 바운디드 큐(업로드·hydrate 공용). 경로 문자열을 키로 받아 동시성을
+ * 제한하며 워커(upload)를 돌린다. 워커가 무엇을 하는지는 주입에 달렸다 — 로컬→서버 업로드
+ * 또는 서버→로컬 hydrate.
  *
  * 폴더를 통째로 드래그앤드랍하면 파일이 100개가 넘을 수 있다. 이를 한 번에 동시
  * 발사하면 서버 DB 커넥션 풀이 고갈되고(요청 hang), 플러그인 쪽도 파일당 WS 세션이
@@ -35,6 +37,8 @@ export interface UploadQueueOptions {
 	onProgress?: (done: number, total: number) => void;
 	/** 큐가 비워질 때 한 번. */
 	onSettled?: (summary: UploadSummary) => void;
+	/** 진단 로그(선택). enqueue/start/retry/batch-settle 시 호출. 동시성·burst 관찰용. */
+	log?: (message: string) => void;
 }
 
 export class UploadQueue {
@@ -52,6 +56,7 @@ export class UploadQueue {
 		this.known.add(path);
 		this.pending.push(path);
 		this.total++;
+		this.opts.log?.(`enqueue ${path} → pending=${this.pending.length} active=${this.active} total=${this.total}`);
 		this.pump();
 	}
 
@@ -68,6 +73,7 @@ export class UploadQueue {
 	}
 
 	private async runOne(path: string): Promise<void> {
+		this.opts.log?.(`start ${path} → active=${this.active}`);
 		let ok = false;
 		for (let attempt = 1; attempt <= this.opts.maxAttempts; attempt++) {
 			try {
@@ -77,7 +83,9 @@ export class UploadQueue {
 			} catch (e) {
 				const canRetry = this.opts.isTransient(e) && attempt < this.opts.maxAttempts;
 				if (!canRetry) break;
-				await this.opts.sleep(this.opts.backoffMs(attempt));
+				const wait = this.opts.backoffMs(attempt);
+				this.opts.log?.(`retry ${path} attempt=${attempt} wait=${wait}ms`);
+				await this.opts.sleep(wait);
 			}
 		}
 		this.settle(ok);
@@ -91,6 +99,7 @@ export class UploadQueue {
 
 		if (this.active === 0 && this.pending.length === 0) {
 			const summary: UploadSummary = { processed: this.done - this.failed, failed: this.failed };
+			this.opts.log?.(`batch settled: processed=${summary.processed} failed=${summary.failed}`);
 			this.reset();
 			this.opts.onSettled?.(summary);
 			return;

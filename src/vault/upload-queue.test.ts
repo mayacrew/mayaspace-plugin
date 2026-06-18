@@ -128,6 +128,17 @@ describe("UploadQueue", () => {
 		expect(slept).toEqual([100, 200]);
 	});
 
+	test("log 훅이 enqueue와 batch settled에서 호출된다", async () => {
+		const logs: string[] = [];
+		await settle((onSettled) => {
+			const q = new UploadQueue(makeOpts({ log: (m) => logs.push(m), onSettled }));
+			q.enqueueAll(["a", "b"]);
+			return q;
+		});
+		expect(logs.some((m) => m.startsWith("enqueue a"))).toBe(true);
+		expect(logs.some((m) => m.startsWith("batch settled"))).toBe(true);
+	});
+
 	test("onProgress가 done/total을 보고한다", async () => {
 		const progress: Array<[number, number]> = [];
 		await settle((onSettled) => {

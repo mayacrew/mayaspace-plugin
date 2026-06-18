@@ -67,8 +67,21 @@ export default class MayaspacePlugin extends Plugin {
 	private fetcher!: Fetcher;
 	mappings!: FileMappings;
 	decorator!: ExplorerDecorator;
-	// 폴더 드랍·reconcile 등 벌크 업로드를 동시성 제한·재시도로 흘려보내는 전역 큐.
+	// 폴더 드랍·reconcile 등 벌크 업로드(로컬→서버)를 동시성 제한·재시도로 흘려보내는 전역 큐.
 	private uploadQueue!: UploadQueue;
+	// SSE로 받은 파일의 본문 hydrate(서버→로컬, REST read)를 동시성 제한으로 흘려보내는 큐.
+	// 다른 기기가 100개를 벌크 생성/수정하면 받는 쪽도 REST read가 폭주하므로 묶는다.
+	private hydrateQueue!: UploadQueue;
+	// 같은 org 안의 파일 이동(rename)을 동시성 제한으로 흘려보내는 큐. 폴더째 100개 이동 시
+	// moveFile burst를 막는다. newPath를 키로 pendingMoves에서 상세를 조회한다.
+	private moveQueue!: UploadQueue;
+	private readonly pendingMoves = new Map<string, { oldPath: string; orgId: string; fileId: string; newRelPath: string }>();
+	// cross-org로 옮겨져 차단된 새 경로(세션 한정). handleVaultCreate가 이 경로의 업로드를 막는다.
+	private readonly crossOrgBlocked = new Set<string>();
+	// cross-org 이동 안내 — 폴더째 이동 시 파일마다 안 뜨고 한 번만 뜨게 디바운스.
+	private readonly warnCrossOrgMove = debounce(() => {
+		new Notice("MayaSpace: 다른 조직(org)으로의 이동은 지원하지 않습니다. 같은 조직 안에서만 이동하세요.");
+	}, 500);
 
 	private events: MayaspaceEvents | null = null;
 	private collabSidebar: CollabSidebarView | null = null;
@@ -114,7 +127,7 @@ export default class MayaspacePlugin extends Plugin {
 		this.rebuildBackendClients();
 		this.buildLiveCollab();
 		this.buildDecorator();
-		this.buildUploadQueue();
+		this.buildQueues();
 
 		this.buildCollabSidebar();
 
@@ -293,7 +306,7 @@ export default class MayaspacePlugin extends Plugin {
 		});
 	}
 
-	private buildUploadQueue(): void {
+	private buildQueues(): void {
 		this.uploadQueue = new UploadQueue({
 			concurrency: UPLOAD_CONCURRENCY,
 			maxAttempts: UPLOAD_MAX_ATTEMPTS,
@@ -302,12 +315,41 @@ export default class MayaspacePlugin extends Plugin {
 			upload: (path) => this.handleVaultCreate(path, { bulk: true }),
 			isTransient: isTransientHttp,
 			sleep,
+			log: (m) => console.log("[mayaspace][upload]", m),
 			onProgress: (done, total) => this.renderUploadProgress(done, total),
 			onSettled: (summary) => {
 				this.uploadStatusItem?.setText("");
 				if (summary.failed > 0) {
 					new Notice(`MayaSpace: ${summary.failed}개 업로드 실패 — 'Sync now'로 다시 시도하세요.`);
 				}
+			},
+		});
+
+		this.hydrateQueue = new UploadQueue({
+			concurrency: HYDRATE_CONCURRENCY,
+			maxAttempts: 1, // hydrateFile이 자체적으로 에러를 삼킨다 — 재시도 없이 동시성만 제한.
+			backoffMs: () => 0,
+			upload: (path) => {
+				const mapping = this.settings.fileMappings[path];
+				return mapping ? this.hydrateFile(path, mapping) : Promise.resolve();
+			},
+			isTransient: () => false,
+			sleep,
+			log: (m) => console.log("[mayaspace][hydrate]", m),
+		});
+
+		this.moveQueue = new UploadQueue({
+			concurrency: UPLOAD_CONCURRENCY,
+			maxAttempts: UPLOAD_MAX_ATTEMPTS,
+			backoffMs: (attempt) => Math.min(UPLOAD_BACKOFF_BASE_MS * 2 ** (attempt - 1), UPLOAD_BACKOFF_MAX_MS),
+			upload: (newPath) => this.runQueuedMove(newPath),
+			isTransient: isTransientHttp,
+			sleep,
+			log: (m) => console.log("[mayaspace][move]", m),
+			onProgress: (done, total) => this.uploadStatusItem?.setText(done < total ? `MayaSpace: 이동 ${done}/${total}` : ""),
+			onSettled: (s) => {
+				this.uploadStatusItem?.setText("");
+				if (s.failed > 0) new Notice(`MayaSpace: ${s.failed}개 이동 실패 — 다시 시도하세요.`);
 			},
 		});
 	}
@@ -468,17 +510,29 @@ export default class MayaspacePlugin extends Plugin {
 		this.registerEvent(
 			this.app.vault.on("create", (f) => {
 				if (f instanceof TFile) {
-					this.handleVaultCreate(f.path).catch((e) => console.warn("[mayaspace] create", e));
+					// 모든 파일 create를 전역 큐로. 폴더 임포트 시 Obsidian이 안쪽 파일마다 개별
+					// create를 쏟아도(100개+) 동시성 상한으로 묶어 서버 풀·WS 폭주를 막는다.
+					// 큐가 dedupe·재시도·진행률을 처리하고, bulk 경로라 파일당 prefetch도 안 연다.
+					this.uploadQueue.enqueue(f.path);
 				} else if (f instanceof TFolder) {
-					// 폴더 드래그앤드랍: 안쪽 파일 create가 누락되므로 폴더 단위로 스캔·업로드한다.
+					// 폴더 드랍 시 안쪽 파일 create가 일부 누락되는 경우 대비: 폴더 단위로 스캔해
+					// 같은 큐에 넣는다(이미 큐/매핑에 있으면 dedupe·멱등 가드가 막음).
 					this.handleFolderCreate(f.path).catch((e) => console.warn("[mayaspace] folder create", e));
 				}
 			}),
 		);
 		this.registerEvent(
 			this.app.vault.on("rename", (f, oldPath) => {
-				if (!(f instanceof TFile)) return;
-				this.handleVaultRename(oldPath, f.path).catch((e) => console.warn("[mayaspace] rename", e));
+				if (f instanceof TFile) {
+					this.handleVaultRename(oldPath, f.path).catch((e) => console.warn("[mayaspace] rename", e));
+				} else if (f instanceof TFolder) {
+					// 폴더가 mayaspace "밖"에서 들어온 신규 import일 때만 스캔-업로드한다. vault 안에서의
+					// 이동(같은 org=파일별 move 큐, cross-org=차단)은 파일별 rename이 처리하므로 폴더
+					// 스캔을 돌리지 않는다 — 안 그러면 이동을 신규 생성으로 오인해 중복 업로드한다.
+					if (!parseMayaspacePath(oldPath, this.settings.mayaspaceRoot)) {
+						this.handleFolderCreate(f.path).catch((e) => console.warn("[mayaspace] folder import", e));
+					}
+				}
 			}),
 		);
 		this.registerEvent(
@@ -656,10 +710,10 @@ export default class MayaspacePlugin extends Plugin {
 	/**
 	 * org 폴더 안에 있는데 매핑(=서버)에 없는 로컬 파일을 서버로 업로드한다.
 	 * create 이벤트가 누락돼(생성 burst·플러그인 리로드) 고아가 된 파일을 자가복구한다.
-	 * markdown만 대상(첨부는 비범위). 권한 없는 파일은 조용히 건너뛴다(폴링마다 Notice 방지).
+	 * 마크다운+첨부 모두 대상(getFiles). 권한 없는 파일은 조용히 건너뛴다(폴링마다 Notice 방지).
 	 */
 	private async reconcileLocalOrphans(synced: SyncResult): Promise<void> {
-		const localFiles = this.app.vault.getMarkdownFiles().map((f) => f.path);
+		const localFiles = this.app.vault.getFiles().map((f) => f.path);
 		const orphans = findUnmappedLocalFiles(
 			localFiles,
 			Object.keys(synced.files),
@@ -674,28 +728,32 @@ export default class MayaspacePlugin extends Plugin {
 	}
 
 	/**
-	 * 폴더를 외부(Finder/Explorer)에서 드래그앤드랍하면 Obsidian이 폴더 create만 안정적으로 쏘고
-	 * 안쪽 파일 create는 누락되기 쉽다. 인덱싱이 안정될 시간을 준 뒤 그 폴더 하위의 매핑 안 된
-	 * 파일(마크다운+첨부)을 전역 업로드 큐(bulk)로 흘려보낸다. 중복은 handleVaultCreate의 매핑/inflight/409
-	 * 가드 + 큐 dedupe가 막으므로 개별 create가 따로 발화돼도 안전하다. 동시성은 큐가 제한해 연결 폭주를 막는다.
+	 * 폴더를 외부(Finder/Explorer)에서 드래그앤드랍하거나 공유 폴더 안으로 이동하면 Obsidian이
+	 * 폴더 이벤트만 안정적으로 쏘고 안쪽 파일 create는 누락되기 쉽다. 게다가 인덱싱이 1.2초보다
+	 * 늦을 수 있어 한 번만 스캔하면 늦게 들어온 파일(특히 큰 첨부)을 놓친다. 그래서 점증 간격으로
+	 * 몇 번 재스캔하며 그때그때 매핑 안 된 하위 파일(마크다운+첨부)을 전역 업로드 큐(bulk)로 흘려보낸다.
+	 * 중복은 handleVaultCreate의 매핑/inflight/409 가드 + 큐 dedupe가 막으므로 재스캔·개별 create가
+	 * 겹쳐도 멱등하다. 동시성은 큐가 제한해 연결 폭주를 막는다.
 	 */
 	private async handleFolderCreate(folderPath: string): Promise<void> {
 		if (this.folderCreateScans.has(folderPath)) return;
 		this.folderCreateScans.add(folderPath);
 		try {
-			await sleep(FOLDER_SETTLE_MS);
-			const all = this.app.vault.getFiles().map((f) => f.path);
-			const targets = findUnmappedFilesUnderFolder(
-				folderPath,
-				all,
-				Object.keys(this.settings.fileMappings),
-				this.settings.mayaspaceRoot,
-				Object.keys(this.settings.orgMappings),
-			);
-			if (targets.length === 0) return;
-			console.log(`[mayaspace] folder drop: queueing ${targets.length} file(s) under ${folderPath}`);
-			// 전역 업로드 큐로 흘려보낸다 — 동시성 제한 + 일시적 실패 재시도 + 진행률.
-			this.uploadQueue.enqueueAll(targets);
+			console.log("[mayaspace] folder create/rename event:", folderPath);
+			for (const delay of FOLDER_RESCAN_DELAYS_MS) {
+				await sleep(delay);
+				const all = this.app.vault.getFiles().map((f) => f.path);
+				const targets = findUnmappedFilesUnderFolder(
+					folderPath,
+					all,
+					Object.keys(this.settings.fileMappings),
+					this.settings.mayaspaceRoot,
+					Object.keys(this.settings.orgMappings),
+				);
+				// 0건이어도 로그를 남긴다 — "무반응"의 원인(이미 매핑됨/인덱싱 지연/org 폴더 밖)을 구분하기 위해.
+				console.log(`[mayaspace] folder scan: all=${all.length} targets=${targets.length} under ${folderPath}`);
+				if (targets.length > 0) this.uploadQueue.enqueueAll(targets);
+			}
 		} finally {
 			this.folderCreateScans.delete(folderPath);
 		}
@@ -795,6 +853,15 @@ export default class MayaspacePlugin extends Plugin {
 		if (active?.file && this.mappings.getFile(active.file.path)) scope.add(active.file.path);
 		for (const path of this.recentlyOpened) scope.add(path);
 		return Array.from(scope).filter((p) => this.settings.fileMappings[p]);
+	}
+
+	/**
+	 * SSE로 갓 받은 파일에 prefetch(WS 세션)를 열어야 하는지. 전체 prefetch 설정이거나
+	 * 라이브 스코프(연 파일·최근 연 파일)일 때만 — 벌크로 받은 나머지는 열 때 붙어 WS 폭주를 막는다.
+	 * startPrefetchAll의 스코프 정책과 동일하게 맞춘다.
+	 */
+	private shouldLivePrefetch(path: string): boolean {
+		return this.settings.prefetchAllFiles || this.livePrefetchScope().includes(path);
 	}
 
 	private noteRecentlyOpened(path: string, mapping: FileMapping): void {
@@ -1087,11 +1154,13 @@ export default class MayaspacePlugin extends Plugin {
 					}
 					await this.saveSettings();
 					this.decorator.refresh();
-					// Pull initial body so search / preview work without opening.
-					await this.hydrateFile(full, { orgId: p.orgId, fileId: p.fileId });
-					// And open a background Hocuspocus session so subsequent
-					// edits from the originating user stream in real-time.
-					void this.startPrefetch(full, { orgId: p.orgId, fileId: p.fileId });
+					// 받는 쪽 폭주 방지(다른 기기가 100개 벌크 생성 시): 본문 hydrate(REST)는
+					// 바운디드 큐로 동시 read를 제한하고, prefetch(WS 세션)는 라이브 스코프
+					// (열린 파일·최근 연 파일)에만 연다 — 벌크로 받은 파일은 열 때 붙는다.
+					this.hydrateQueue.enqueue(full);
+					if (this.shouldLivePrefetch(full)) {
+						void this.startPrefetch(full, { orgId: p.orgId, fileId: p.fileId });
+					}
 				},
 				onDeleted: async (p) => {
 					console.log("[mayaspace] SSE onDeleted", p);
@@ -1184,7 +1253,8 @@ export default class MayaspacePlugin extends Plugin {
 						console.log("[mayaspace] onUpdated skipped (live session active)", localPath);
 						return;
 					}
-					await this.hydrateFile(localPath, { orgId: p.orgId, fileId: p.fileId });
+					// 동시 REST read 제한(다른 기기 벌크 수정 시 폭주 방지) — 바운디드 큐로.
+					this.hydrateQueue.enqueue(localPath);
 				},
 				onPresenceChanged: (p) => {
 					if (this.collabSidebar) {
@@ -1271,6 +1341,7 @@ export default class MayaspacePlugin extends Plugin {
 	private async handleVaultCreate(path: string, opts: { bulk?: boolean } = {}): Promise<void> {
 		if (this.mappings.getFile(path)) return; // our own placeholder
 		if (this.inflightCreates.has(path)) return; // race: second event for same path
+		if (this.crossOrgBlocked.has(path)) return; // cross-org 이동으로 차단된 경로 — 새 org에 업로드 안 함
 		const parsed = parseMayaspacePath(path, this.settings.mayaspaceRoot);
 		if (!parsed) return;
 		const orgId = this.settings.orgMappings[parsed.orgName];
@@ -1332,11 +1403,10 @@ export default class MayaspacePlugin extends Plugin {
 			await this.saveSettings();
 			this.decorator.refresh();
 			await this.attachCreatedFileIfActive(path, { orgId, fileId: meta.id });
-			// Start a background prefetch session so future external/remote
-			// edits on this file stream into the vault automatically. bulk import은
-			// 건너뛴다 — 파일당 WS 세션을 열면 100개 드랍 시 세션이 폭주한다. 그 파일을
-			// 사용자가 열 때 prefetch가 붙는다(로컬이 원본이라 즉시 재수신도 불필요).
-			if (!opts.bulk) void this.startPrefetch(path, { orgId, fileId: meta.id });
+			// prefetch(WS 세션)는 라이브 스코프(연/최근 연 파일)일 때만 연다 — onCreated 수신 경로와
+			// 동일 정책. 벌크로 만든/이동한 파일 100개에 파일당 세션을 열면 폭주하므로, 그 파일을 열 때
+			// 붙인다. 활성 파일은 위 attachCreatedFileIfActive가 이미 처리.
+			if (this.shouldLivePrefetch(path)) void this.startPrefetch(path, { orgId, fileId: meta.id });
 		} finally {
 			this.inflightCreates.delete(path);
 		}
@@ -1453,14 +1523,10 @@ export default class MayaspacePlugin extends Plugin {
 		// 둘 다 mayaspace 밖이면 무관.
 		if (!parsedOld && !parsedNew) return;
 
-		// 밖 → 안: 사실상 신규 진입. vault.on('create')는 발화하지 않으므로
-		// handleVaultCreate에 위임해 서버 등록 + 본문 업로드 + prefetch까지 한 번에 처리.
+		// 밖 → 안: 사실상 신규 진입. vault.on('create')는 발화하지 않으므로 전역 업로드 큐로 태운다
+		// (폴더째 이동 시 파일별 rename이 100개 와도 동시성 제한). 권한 체크는 handleVaultCreate가 한다.
 		if (!parsedOld && parsedNew) {
-			const orgId = this.settings.orgMappings[parsedNew.orgName];
-			const perms = orgId ? this.permsForNewPath(orgId, newPath) : 0;
-			const g = checkCreate(perms);
-			if (!g.allowed) { new Notice(g.message!); return; }
-			await this.handleVaultCreate(newPath);
+			this.uploadQueue.enqueue(newPath);
 			return;
 		}
 
@@ -1483,22 +1549,43 @@ export default class MayaspacePlugin extends Plugin {
 		// 둘 다 mayaspace 안 — 기존 move 로직.
 		const mapping = this.settings.fileMappings[oldPath];
 		if (!mapping) return;
+		// cross-org 이동은 미지원(org=별개 vault라 서버에 cross-org move API 없음). 차단하고 새 org에
+		// 업로드되지 않게 막는다(원본 org 유지). Notice는 폴더째 이동 시 100번 안 뜨게 디바운스.
 		if (parsedOld!.orgName !== parsedNew!.orgName) {
-			new Notice("MayaSpace: cross-org moves aren't supported yet.");
+			this.crossOrgBlocked.add(newPath);
+			this.warnCrossOrgMove();
 			return;
 		}
 		const orgIdSame = this.settings.orgMappings[parsedNew!.orgName];
 		const permsSame = orgIdSame ? this.permsForNewPath(orgIdSame, newPath) : 0;
 		const gMove = checkMove(permsSame);
 		if (!gMove.allowed) { new Notice(gMove.message!); return; }
+		// 같은 org 이동: 폴더째 100개를 옮겨도 동시 moveFile burst가 안 나게 큐로(동시성 제한 + 재시도).
+		this.pendingMoves.set(newPath, {
+			oldPath,
+			orgId: mapping.orgId,
+			fileId: mapping.fileId,
+			newRelPath: parsedNew!.relPath,
+		});
+		this.moveQueue.enqueue(newPath);
+	}
+
+	/** moveQueue 워커: 보류 중인 같은 org 이동 1건을 서버에 반영하고 매핑을 갱신한다. */
+	private async runQueuedMove(newPath: string): Promise<void> {
+		const move = this.pendingMoves.get(newPath);
+		if (!move) return;
 		try {
-			await this.api.moveFile(mapping.orgId, mapping.fileId, parsedNew!.relPath);
-			delete this.settings.fileMappings[oldPath];
-			this.settings.fileMappings[newPath] = mapping;
+			await this.api.moveFile(move.orgId, move.fileId, move.newRelPath);
+			delete this.settings.fileMappings[move.oldPath];
+			this.settings.fileMappings[newPath] = { orgId: move.orgId, fileId: move.fileId };
 			await this.saveSettings();
 			this.decorator.refresh();
+			this.pendingMoves.delete(newPath);
 		} catch (e) {
-			console.warn("[mayaspace] moveFile failed", oldPath, "→", newPath, e);
+			if (isPathConflict(e)) { this.pendingMoves.delete(newPath); return; } // 이미 이동됨(멱등)
+			if (isTransientHttp(e)) throw e; // 큐가 백오프 재시도 — pendingMoves 유지
+			console.warn("[mayaspace] moveFile failed", move.oldPath, "→", newPath, e);
+			this.pendingMoves.delete(newPath);
 		}
 	}
 
@@ -1658,8 +1745,9 @@ function describe(e: unknown): string {
 
 // Cap on simultaneous REST hydrate reads (see hydrateAllPlaceholders / #6).
 const HYDRATE_CONCURRENCY = 4;
-// 폴더 드래그앤드랍 후 Obsidian이 안쪽 파일을 인덱싱할 시간을 준 뒤 스캔한다.
-const FOLDER_SETTLE_MS = 1200;
+// 폴더 드랍/이동 후 Obsidian 인덱싱이 늦을 수 있어 한 번이 아니라 점증 간격으로 재스캔한다.
+// 늦게 들어온 파일(특히 큰 첨부)을 놓치지 않게. 각 스캔 결과는 큐가 dedupe하므로 멱등.
+const FOLDER_RESCAN_DELAYS_MS = [1200, 4000, 10000];
 // 전역 업로드 큐: 동시성 상한(서버 DB 풀보다 작게 — /me 등 다른 요청이 굶지 않게)과 재시도.
 const UPLOAD_CONCURRENCY = 4;
 const UPLOAD_MAX_ATTEMPTS = 5;
