@@ -24,6 +24,7 @@ import { ConfirmModal } from "./auth/confirm-modal";
 
 import { makeObsidianFetcher, type Fetcher } from "./api/mayaspace-http";
 import { MayaspaceApi, EtagMismatchError, type FileMeta } from "./api/mayaspace-api";
+import { isPathConflict, isTransientHttp } from "./api/http-errors";
 
 import { MayaspaceSync, defaultHocuspocusFactory } from "./sync/mayaspace-sync";
 import { LiveCollabSession } from "./sync/live-collab-session";
@@ -33,6 +34,7 @@ import { debounce } from "./lib/debounce";
 import { mergeDiskIntoYtext } from "./lib/merge-disk-into-ytext";
 
 import { syncOrgTrees, findUnmappedLocalFiles, findUnmappedFilesUnderFolder, type FileMapping, type SyncResult } from "./vault/tree-sync";
+import { UploadQueue } from "./vault/upload-queue";
 import { FileMappings } from "./vault/file-mappings";
 import { TreePoller, type PollerVault } from "./vault/tree-poller";
 
@@ -65,6 +67,8 @@ export default class MayaspacePlugin extends Plugin {
 	private fetcher!: Fetcher;
 	mappings!: FileMappings;
 	decorator!: ExplorerDecorator;
+	// 폴더 드랍·reconcile 등 벌크 업로드를 동시성 제한·재시도로 흘려보내는 전역 큐.
+	private uploadQueue!: UploadQueue;
 
 	private events: MayaspaceEvents | null = null;
 	private collabSidebar: CollabSidebarView | null = null;
@@ -76,6 +80,8 @@ export default class MayaspacePlugin extends Plugin {
 		void this.syncTrees().catch((e) => console.warn("[mayaspace] access.changed resync", e));
 	}, 800);
 	private statusBarItem: HTMLElement | null = null;
+	// 벌크 업로드 진행률 전용 아이템. 계정 상태바(saveSettings가 갱신)와 분리해 충돌을 막는다.
+	private uploadStatusItem: HTMLElement | null = null;
 	private fileStatuses: Record<string, SyncStatus> = {};
 	private settingTab: MayaspaceSettingTab | null = null;
 	private prefetches = new Map<string, () => void>();
@@ -108,6 +114,7 @@ export default class MayaspacePlugin extends Plugin {
 		this.rebuildBackendClients();
 		this.buildLiveCollab();
 		this.buildDecorator();
+		this.buildUploadQueue();
 
 		this.buildCollabSidebar();
 
@@ -116,6 +123,7 @@ export default class MayaspacePlugin extends Plugin {
 		this.registerCommands();
 
 		this.statusBarItem = this.addStatusBarItem();
+		this.uploadStatusItem = this.addStatusBarItem();
 		this.renderStatusBar();
 
 		this.registerVaultHandlers();
@@ -283,6 +291,29 @@ export default class MayaspacePlugin extends Plugin {
 			getOrgFilePaths: () => Object.keys(this.settings.fileMappings),
 			getStatuses: () => this.fileStatuses,
 		});
+	}
+
+	private buildUploadQueue(): void {
+		this.uploadQueue = new UploadQueue({
+			concurrency: UPLOAD_CONCURRENCY,
+			maxAttempts: UPLOAD_MAX_ATTEMPTS,
+			backoffMs: (attempt) => Math.min(UPLOAD_BACKOFF_BASE_MS * 2 ** (attempt - 1), UPLOAD_BACKOFF_MAX_MS),
+			// bulk: prefetch/hydrate/Notice를 건너뛰고, 일시적 실패는 큐가 재시도하도록 위로 던진다.
+			upload: (path) => this.handleVaultCreate(path, { bulk: true }),
+			isTransient: isTransientHttp,
+			sleep,
+			onProgress: (done, total) => this.renderUploadProgress(done, total),
+			onSettled: (summary) => {
+				this.uploadStatusItem?.setText("");
+				if (summary.failed > 0) {
+					new Notice(`MayaSpace: ${summary.failed}개 업로드 실패 — 'Sync now'로 다시 시도하세요.`);
+				}
+			},
+		});
+	}
+
+	private renderUploadProgress(done: number, total: number): void {
+		this.uploadStatusItem?.setText(done < total ? `MayaSpace: 업로드 ${done}/${total}` : "");
 	}
 
 	private buildCollabSidebar(): void {
@@ -636,24 +667,17 @@ export default class MayaspacePlugin extends Plugin {
 			Object.keys(synced.orgs),
 		);
 
-		for (const path of orphans) {
-			const parsed = parseMayaspacePath(path, this.settings.mayaspaceRoot);
-			if (!parsed) continue;
-			const orgId = this.settings.orgMappings[parsed.orgName];
-			if (!orgId) continue;
-			if (!checkCreate(this.permsForNewPath(orgId, path)).allowed) continue;
-			console.log("[mayaspace] reconcile: uploading orphaned local file", path);
-			await this.handleVaultCreate(path).catch((e) =>
-				console.warn("[mayaspace] reconcile upload failed", path, e),
-			);
-		}
+		if (orphans.length === 0) return;
+		// 전역 업로드 큐로(bulk) — 동시성 제한 + 재시도. 권한 없는 파일은 handleVaultCreate가 조용히 스킵.
+		console.log(`[mayaspace] reconcile: queueing ${orphans.length} orphaned local file(s)`);
+		this.uploadQueue.enqueueAll(orphans);
 	}
 
 	/**
 	 * 폴더를 외부(Finder/Explorer)에서 드래그앤드랍하면 Obsidian이 폴더 create만 안정적으로 쏘고
 	 * 안쪽 파일 create는 누락되기 쉽다. 인덱싱이 안정될 시간을 준 뒤 그 폴더 하위의 매핑 안 된
-	 * 파일(마크다운+첨부)을 일괄 업로드한다. 중복은 handleVaultCreate의 매핑/inflight/409 가드가 막으므로
-	 * 개별 create가 따로 발화돼도 안전하다. 동시성은 runBounded로 제한해 연결 폭주를 막는다.
+	 * 파일(마크다운+첨부)을 전역 업로드 큐(bulk)로 흘려보낸다. 중복은 handleVaultCreate의 매핑/inflight/409
+	 * 가드 + 큐 dedupe가 막으므로 개별 create가 따로 발화돼도 안전하다. 동시성은 큐가 제한해 연결 폭주를 막는다.
 	 */
 	private async handleFolderCreate(folderPath: string): Promise<void> {
 		if (this.folderCreateScans.has(folderPath)) return;
@@ -669,10 +693,9 @@ export default class MayaspacePlugin extends Plugin {
 				Object.keys(this.settings.orgMappings),
 			);
 			if (targets.length === 0) return;
-			console.log(`[mayaspace] folder drop: uploading ${targets.length} file(s) under ${folderPath}`);
-			await runBounded(FOLDER_UPLOAD_CONCURRENCY, targets, (p) =>
-				this.handleVaultCreate(p).catch((e) => console.warn("[mayaspace] folder upload failed", p, e)),
-			);
+			console.log(`[mayaspace] folder drop: queueing ${targets.length} file(s) under ${folderPath}`);
+			// 전역 업로드 큐로 흘려보낸다 — 동시성 제한 + 일시적 실패 재시도 + 진행률.
+			this.uploadQueue.enqueueAll(targets);
 		} finally {
 			this.folderCreateScans.delete(folderPath);
 		}
@@ -1240,7 +1263,12 @@ export default class MayaspacePlugin extends Plugin {
 		}
 	}
 
-	private async handleVaultCreate(path: string): Promise<void> {
+	/**
+	 * @param opts.bulk 폴더 드랍/reconcile 같은 일괄 업로드 경로. 파일당 prefetch(WS 세션)와
+	 *   권한-거부 Notice를 억제하고(100개 드랍 시 폭주 방지), 일시적 실패(429/5xx/네트워크)는
+	 *   삼키지 않고 던져 업로드 큐가 백오프 재시도하게 한다. 로컬이 원본이라 hydrate도 불필요.
+	 */
+	private async handleVaultCreate(path: string, opts: { bulk?: boolean } = {}): Promise<void> {
 		if (this.mappings.getFile(path)) return; // our own placeholder
 		if (this.inflightCreates.has(path)) return; // race: second event for same path
 		const parsed = parseMayaspacePath(path, this.settings.mayaspaceRoot);
@@ -1250,7 +1278,7 @@ export default class MayaspacePlugin extends Plugin {
 		const perms = this.permsForNewPath(orgId, path);
 		const guard = checkCreate(perms);
 		if (!guard.allowed) {
-			new Notice(guard.message!);
+			if (!opts.bulk) new Notice(guard.message!);
 			return;
 		}
 		this.inflightCreates.add(path);
@@ -1289,20 +1317,13 @@ export default class MayaspacePlugin extends Plugin {
 			try {
 				meta = await this.api.createFile(orgId, parsed.relPath, contentBase64);
 			} catch (e) {
-				const msg = e instanceof Error ? e.message : String(e);
-				// 409 path-conflict is the well-formed error. Some server
-				// versions leak the underlying DB error as a 500 with
-				// "duplicate key value violates unique constraint
-				// file_meta_org_path_uq" — same root cause, same handling.
-				if (
-					/\b409\b/.test(msg) ||
-					/path-conflict/.test(msg) ||
-					/duplicate key/i.test(msg) ||
-					/file_meta_org_path_uq/.test(msg)
-				) {
+				// 이미 존재(409, 또는 일부 서버가 누설하는 duplicate-key 500)는 멱등하게 스킵.
+				if (isPathConflict(e)) {
 					console.log("[mayaspace] create skipped — server says path exists", path);
 					return;
 				}
+				// bulk(큐) 경로의 일시적 실패는 위로 던져 큐가 백오프 재시도하게 한다.
+				if (opts.bulk && isTransientHttp(e)) throw e;
 				console.warn("[mayaspace] createFile failed", path, e);
 				return;
 			}
@@ -1312,8 +1333,10 @@ export default class MayaspacePlugin extends Plugin {
 			this.decorator.refresh();
 			await this.attachCreatedFileIfActive(path, { orgId, fileId: meta.id });
 			// Start a background prefetch session so future external/remote
-			// edits on this file stream into the vault automatically.
-			void this.startPrefetch(path, { orgId, fileId: meta.id });
+			// edits on this file stream into the vault automatically. bulk import은
+			// 건너뛴다 — 파일당 WS 세션을 열면 100개 드랍 시 세션이 폭주한다. 그 파일을
+			// 사용자가 열 때 prefetch가 붙는다(로컬이 원본이라 즉시 재수신도 불필요).
+			if (!opts.bulk) void this.startPrefetch(path, { orgId, fileId: meta.id });
 		} finally {
 			this.inflightCreates.delete(path);
 		}
@@ -1637,8 +1660,11 @@ function describe(e: unknown): string {
 const HYDRATE_CONCURRENCY = 4;
 // 폴더 드래그앤드랍 후 Obsidian이 안쪽 파일을 인덱싱할 시간을 준 뒤 스캔한다.
 const FOLDER_SETTLE_MS = 1200;
-// 폴더 드랍 일괄 업로드 동시성(연결 폭주 방지).
-const FOLDER_UPLOAD_CONCURRENCY = 4;
+// 전역 업로드 큐: 동시성 상한(서버 DB 풀보다 작게 — /me 등 다른 요청이 굶지 않게)과 재시도.
+const UPLOAD_CONCURRENCY = 4;
+const UPLOAD_MAX_ATTEMPTS = 5;
+const UPLOAD_BACKOFF_BASE_MS = 500;
+const UPLOAD_BACKOFF_MAX_MS = 8000;
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Debounce for file-open → live-collab (re)bind. Long enough to coalesce rapid
