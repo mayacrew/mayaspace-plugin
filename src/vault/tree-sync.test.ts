@@ -1,4 +1,4 @@
-import { syncOrgTrees, findUnmappedLocalFiles, type VaultLike, type ApiLike } from "./tree-sync";
+import { syncOrgTrees, findUnmappedLocalFiles, findUnmappedFilesUnderFolder, type VaultLike, type ApiLike } from "./tree-sync";
 
 function makeVault() {
 	const existing = new Set<string>();
@@ -255,5 +255,34 @@ describe("findUnmappedLocalFiles", () => {
 
 	test("입력이 비면 빈 배열", () => {
 		expect(findUnmappedLocalFiles([], [], root, orgFolders)).toEqual([]);
+	});
+});
+
+describe("findUnmappedFilesUnderFolder", () => {
+	const root = "MayaSpace";
+	const orgFolders = ["new-org"];
+
+	test("드랍한 폴더 하위(하위폴더 포함)의 미매핑 파일만 반환한다 — 마크다운+첨부", () => {
+		const all = [
+			"MayaSpace/new-org/drop/a.md",
+			"MayaSpace/new-org/drop/sub/b.md",
+			"MayaSpace/new-org/drop/img.png",
+			"MayaSpace/new-org/other/c.md", // 드랍 폴더 밖
+		];
+		const known = ["MayaSpace/new-org/drop/a.md"]; // 이미 매핑됨 → 제외
+		expect(
+			findUnmappedFilesUnderFolder("MayaSpace/new-org/drop", all, known, root, orgFolders).sort(),
+		).toEqual(["MayaSpace/new-org/drop/img.png", "MayaSpace/new-org/drop/sub/b.md"].sort());
+	});
+
+	test("org 폴더 밖에 드랍한 폴더는 빈 배열", () => {
+		const all = ["Other/x/a.md"];
+		expect(findUnmappedFilesUnderFolder("Other/x", all, [], root, orgFolders)).toEqual([]);
+	});
+
+	test("같은 이름의 형제 폴더 접두 오탐 방지(슬래시 경계)", () => {
+		const all = ["MayaSpace/new-org/drop2/a.md"];
+		// "drop"으로 드랍했지만 "drop2"는 포함되면 안 됨
+		expect(findUnmappedFilesUnderFolder("MayaSpace/new-org/drop", all, [], root, orgFolders)).toEqual([]);
 	});
 });

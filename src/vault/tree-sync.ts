@@ -130,6 +130,24 @@ export function findUnmappedLocalFiles(
 	return out;
 }
 
+/**
+ * 드랍된 폴더(folderPath) 하위의, 매핑 안 된 org 폴더 내 파일들. 폴더 드래그앤드랍 시
+ * Obsidian이 안쪽 파일마다 create를 안정적으로 발화하지 않는 문제를 보완해 일괄 업로드 대상을 돌려준다.
+ * 마크다운·첨부 모두 포함하려면 localFiles에 둘 다 넣어 호출한다(getFiles()). 순수 함수.
+ */
+export function findUnmappedFilesUnderFolder(
+	folderPath: string,
+	localFiles: string[],
+	knownPaths: Iterable<string>,
+	mayaspaceRoot: string,
+	orgFolders: Iterable<string>,
+): string[] {
+	// 슬래시 경계로 접두 비교해 형제 폴더(drop vs drop2) 오탐을 막는다.
+	const prefix = `${folderPath}/`.normalize("NFC");
+	const under = localFiles.filter((p) => p.normalize("NFC").startsWith(prefix));
+	return findUnmappedLocalFiles(under, knownPaths, mayaspaceRoot, orgFolders);
+}
+
 async function ensureFolder(vault: VaultLike, path: string): Promise<void> {
 	if (vault.getAbstractFileByPath(path)) return;
 	try {

@@ -9,7 +9,7 @@
  * this file is glue.
  */
 
-import { Editor, MarkdownView, Notice, Plugin, TFile, requestUrl } from "obsidian";
+import { Editor, MarkdownView, Notice, Plugin, TFile, TFolder, requestUrl } from "obsidian";
 
 import {
 	MayaspaceSettings,
@@ -32,7 +32,7 @@ import { shouldApplyPrefetch } from "./sync/prefetch-policy";
 import { debounce } from "./lib/debounce";
 import { mergeDiskIntoYtext } from "./lib/merge-disk-into-ytext";
 
-import { syncOrgTrees, findUnmappedLocalFiles, type FileMapping, type SyncResult } from "./vault/tree-sync";
+import { syncOrgTrees, findUnmappedLocalFiles, findUnmappedFilesUnderFolder, type FileMapping, type SyncResult } from "./vault/tree-sync";
 import { FileMappings } from "./vault/file-mappings";
 import { TreePoller, type PollerVault } from "./vault/tree-poller";
 
@@ -95,6 +95,9 @@ export default class MayaspacePlugin extends Plugin {
 	// this guard we'd race two creates → second one hits the (orgId,path)
 	// unique constraint on the server and surfaces a 500.
 	private inflightCreates = new Set<string>();
+
+	// 폴더 드랍 스캔이 진행 중인 폴더 경로(같은 폴더 중복 스캔 방지).
+	private readonly folderCreateScans = new Set<string>();
 	// Debounce timer for file-open → live-collab (re)binding. See file-open
 	// handler: coalesces rapid in-leaf file switching so it binds once settled.
 	private fileOpenTimer: ReturnType<typeof setTimeout> | null = null;
@@ -433,8 +436,12 @@ export default class MayaspacePlugin extends Plugin {
 	private registerVaultHandlers(): void {
 		this.registerEvent(
 			this.app.vault.on("create", (f) => {
-				if (!(f instanceof TFile)) return;
-				this.handleVaultCreate(f.path).catch((e) => console.warn("[mayaspace] create", e));
+				if (f instanceof TFile) {
+					this.handleVaultCreate(f.path).catch((e) => console.warn("[mayaspace] create", e));
+				} else if (f instanceof TFolder) {
+					// 폴더 드래그앤드랍: 안쪽 파일 create가 누락되므로 폴더 단위로 스캔·업로드한다.
+					this.handleFolderCreate(f.path).catch((e) => console.warn("[mayaspace] folder create", e));
+				}
 			}),
 		);
 		this.registerEvent(
@@ -639,6 +646,35 @@ export default class MayaspacePlugin extends Plugin {
 			await this.handleVaultCreate(path).catch((e) =>
 				console.warn("[mayaspace] reconcile upload failed", path, e),
 			);
+		}
+	}
+
+	/**
+	 * 폴더를 외부(Finder/Explorer)에서 드래그앤드랍하면 Obsidian이 폴더 create만 안정적으로 쏘고
+	 * 안쪽 파일 create는 누락되기 쉽다. 인덱싱이 안정될 시간을 준 뒤 그 폴더 하위의 매핑 안 된
+	 * 파일(마크다운+첨부)을 일괄 업로드한다. 중복은 handleVaultCreate의 매핑/inflight/409 가드가 막으므로
+	 * 개별 create가 따로 발화돼도 안전하다. 동시성은 runBounded로 제한해 연결 폭주를 막는다.
+	 */
+	private async handleFolderCreate(folderPath: string): Promise<void> {
+		if (this.folderCreateScans.has(folderPath)) return;
+		this.folderCreateScans.add(folderPath);
+		try {
+			await sleep(FOLDER_SETTLE_MS);
+			const all = this.app.vault.getFiles().map((f) => f.path);
+			const targets = findUnmappedFilesUnderFolder(
+				folderPath,
+				all,
+				Object.keys(this.settings.fileMappings),
+				this.settings.mayaspaceRoot,
+				Object.keys(this.settings.orgMappings),
+			);
+			if (targets.length === 0) return;
+			console.log(`[mayaspace] folder drop: uploading ${targets.length} file(s) under ${folderPath}`);
+			await runBounded(FOLDER_UPLOAD_CONCURRENCY, targets, (p) =>
+				this.handleVaultCreate(p).catch((e) => console.warn("[mayaspace] folder upload failed", p, e)),
+			);
+		} finally {
+			this.folderCreateScans.delete(folderPath);
 		}
 	}
 
@@ -1599,6 +1635,11 @@ function describe(e: unknown): string {
 
 // Cap on simultaneous REST hydrate reads (see hydrateAllPlaceholders / #6).
 const HYDRATE_CONCURRENCY = 4;
+// 폴더 드래그앤드랍 후 Obsidian이 안쪽 파일을 인덱싱할 시간을 준 뒤 스캔한다.
+const FOLDER_SETTLE_MS = 1200;
+// 폴더 드랍 일괄 업로드 동시성(연결 폭주 방지).
+const FOLDER_UPLOAD_CONCURRENCY = 4;
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Debounce for file-open → live-collab (re)bind. Long enough to coalesce rapid
 // in-leaf file switching, short enough to feel instant once the user settles.
