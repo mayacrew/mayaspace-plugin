@@ -206,6 +206,38 @@ describe("MayaspaceApi", () => {
 		expect(calls[0].body).toContain("archive/note.md");
 	});
 
+	test("listTrash: GET /v1/orgs/:oid/files/trash returns files", async () => {
+		const { auth } = await authedAuth();
+		const calls: HttpRequest[] = [];
+		const fetcher: Fetcher = async (req) => {
+			calls.push(req);
+			return jsonResponse(200, { files: [{ id: "f1", path: "gone.md", size: 3, deleted_at: "2026-06-19T00:00:00Z" }] });
+		};
+		const api = new MayaspaceApi("https://api.test", auth, fetcher);
+
+		const out = await api.listTrash("o1");
+		expect(out).toEqual([{ id: "f1", path: "gone.md", size: 3, deleted_at: "2026-06-19T00:00:00Z" }]);
+		expect(calls[0].method).toBe("GET");
+		expect(calls[0].url).toBe("https://api.test/v1/orgs/o1/files/trash");
+	});
+
+	test("restoreFiles: POST /v1/orgs/:oid/files/trash/restore with file_ids", async () => {
+		const { auth } = await authedAuth();
+		const calls: HttpRequest[] = [];
+		const fetcher: Fetcher = async (req) => {
+			calls.push(req);
+			return jsonResponse(200, { restored: ["f1"], failed: [{ file_id: "f2", reason: "conflict" }] });
+		};
+		const api = new MayaspaceApi("https://api.test", auth, fetcher);
+
+		const out = await api.restoreFiles("o1", ["f1", "f2"]);
+		expect(out.restored).toEqual(["f1"]);
+		expect(out.failed).toEqual([{ file_id: "f2", reason: "conflict" }]);
+		expect(calls[0].method).toBe("POST");
+		expect(calls[0].url).toBe("https://api.test/v1/orgs/o1/files/trash/restore");
+		expect(JSON.parse(calls[0].body as string)).toEqual({ file_ids: ["f1", "f2"] });
+	});
+
 	test("me(): GET /v1/auth/me", async () => {
 		const { auth } = await authedAuth();
 		const fetcher: Fetcher = async () => jsonResponse(200, { id: "u1", email: "alice@example.com", deviceId: "d1" });
