@@ -1,4 +1,24 @@
-import { TreePoller } from "./tree-poller";
+import { TreePoller, shouldSkipMassDeletion } from "./tree-poller";
+
+describe("shouldSkipMassDeletion", () => {
+	test("삭제 후보 0이면 건너뛰지 않는다", () => {
+		expect(shouldSkipMassDeletion(0, 100)).toBe(false);
+	});
+	test("소수 삭제는 진행한다(단일 파일 삭제 등)", () => {
+		expect(shouldSkipMassDeletion(1, 1)).toBe(false);
+		expect(shouldSkipMassDeletion(3, 100)).toBe(false);
+	});
+	test("대량(절대치+비율 초과)이면 건너뛴다 — 빈/부분 트리 열화", () => {
+		expect(shouldSkipMassDeletion(100, 100)).toBe(true); // 빈 트리로 전부 사라짐
+		expect(shouldSkipMassDeletion(60, 100)).toBe(true);
+	});
+	test("절대치는 넘지만 비율 미만이면 진행한다", () => {
+		expect(shouldSkipMassDeletion(20, 100)).toBe(false);
+	});
+	test("절대치 미만이면 비율이 높아도 진행한다(작은 org)", () => {
+		expect(shouldSkipMassDeletion(5, 5)).toBe(false);
+	});
+});
 
 // Mirror Obsidian's contract: vault.delete requires a TAbstractFile object,
 // not a string path. Passing a string throws — the old mock hid that bug.
