@@ -43,6 +43,7 @@ import { MayaspaceEvents } from "./events/sse-subscriber";
 import { makePeerIdentity } from "./ui/peer-identity";
 import { ExplorerDecorator, type SyncStatus } from "./ui/explorer-decorator";
 import { CollabSidebarView, VIEW_TYPE_COLLAB, type CollabSidebarCallbacks } from "./ui/collab-sidebar";
+import { TrashModal } from "./ui/trash-modal";
 
 import { parseMayaspacePath, sanitizeFolderName, canonicalServerPath } from "./lib/path";
 import { READ, UPDATE, CREATE, DELETE, can } from "./lib/permissions";
@@ -454,6 +455,16 @@ export default class MayaspacePlugin extends Plugin {
 			id: "smoke-capabilities",
 			name: "MayaSpace: Check server capabilities",
 			callback: () => this.smokeCheckCapabilities(),
+		});
+		this.addCommand({
+			id: "restore-deleted",
+			name: "MayaSpace: 삭제된 파일 복구",
+			callback: () => {
+				if (!this.settings.tokenSet) { new Notice("먼저 로그인하세요."); return; }
+				const orgs = Object.entries(this.settings.orgMappings).map(([folder, orgId]) => ({ folder, orgId }));
+				if (orgs.length === 0) { new Notice("동기화된 조직이 없습니다."); return; }
+				new TrashModal(this.app, this.api, orgs, () => void this.syncTrees().catch(() => {})).open();
+			},
 		});
 	}
 
