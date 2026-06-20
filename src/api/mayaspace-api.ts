@@ -60,6 +60,8 @@ export interface Org {
 }
 export interface OrgMember { user_id: string; role: string; }
 export interface FileMeta { id: string; path: string; etag?: string; mtime?: string; size?: number; effective_permissions?: number; }
+export interface TrashItem { id: string; path: string; size: number; deleted_at: string; }
+export interface RestoreSummary { restored: string[]; failed: { file_id: string; reason: string }[]; }
 export interface UserInfo { id: string; email: string; deviceId?: string; }
 
 export class EtagMismatchError extends Error {
@@ -133,6 +135,15 @@ export class MayaspaceApi {
 	}
 	async deleteFile(orgId: string, fileId: string): Promise<void> {
 		await this.request<void>("DELETE", `/v1/orgs/${enc(orgId)}/files/${enc(fileId)}`);
+	}
+	async listTrash(orgId: string): Promise<TrashItem[]> {
+		const body = await this.request<{ files: TrashItem[] }>("GET", `/v1/orgs/${enc(orgId)}/files/trash`);
+		return body.files;
+	}
+	restoreFiles(orgId: string, fileIds: string[]): Promise<RestoreSummary> {
+		return this.request<RestoreSummary>("POST", `/v1/orgs/${enc(orgId)}/files/trash/restore`, {
+			body: { file_ids: fileIds },
+		});
 	}
 	async moveFile(orgId: string, fileId: string, newPath: string): Promise<void> {
 		await this.request<void>("POST", `/v1/orgs/${enc(orgId)}/files/${enc(fileId)}/move`, {
