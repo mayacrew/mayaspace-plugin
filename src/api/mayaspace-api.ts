@@ -60,6 +60,8 @@ export interface Org {
 }
 export interface OrgMember { user_id: string; role: string; }
 export interface FileMeta { id: string; path: string; etag?: string; mtime?: string; size?: number; effective_permissions?: number; }
+export interface ShareCreated { id: string; token: string; url: string; permission: "read" | "edit"; expires_at: string | null; }
+export interface ShareListItem { id: string; permission: "read" | "edit"; expires_at: string | null; created_at: string; }
 export interface UserInfo { id: string; email: string; deviceId?: string; }
 
 export class EtagMismatchError extends Error {
@@ -138,6 +140,24 @@ export class MayaspaceApi {
 		await this.request<void>("POST", `/v1/orgs/${enc(orgId)}/files/${enc(fileId)}/move`, {
 			body: { new_path: newPath },
 		});
+	}
+
+	// ---- P2P 외부 공유 ----
+	createShare(
+		orgId: string,
+		fileId: string,
+		opts: { permission: "read" | "edit"; expiresAt?: string | null },
+	): Promise<ShareCreated> {
+		const body: { permission: string; expires_at?: string } = { permission: opts.permission };
+		if (opts.expiresAt) body.expires_at = opts.expiresAt;
+		return this.request<ShareCreated>("POST", `/v1/orgs/${enc(orgId)}/files/${enc(fileId)}/shares`, { body });
+	}
+	async listShares(orgId: string, fileId: string): Promise<ShareListItem[]> {
+		const b = await this.request<{ shares: ShareListItem[] }>("GET", `/v1/orgs/${enc(orgId)}/files/${enc(fileId)}/shares`);
+		return b.shares;
+	}
+	async revokeShare(orgId: string, shareId: string): Promise<void> {
+		await this.request<void>("DELETE", `/v1/orgs/${enc(orgId)}/shares/${enc(shareId)}`);
 	}
 
 	// ---- Collab / Presence ----

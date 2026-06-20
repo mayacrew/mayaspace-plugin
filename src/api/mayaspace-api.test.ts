@@ -206,6 +206,51 @@ describe("MayaspaceApi", () => {
 		expect(calls[0].body).toContain("archive/note.md");
 	});
 
+	test("createShare: POST .../files/:fid/shares with permission+expires_at", async () => {
+		const { auth } = await authedAuth();
+		const calls: HttpRequest[] = [];
+		const fetcher: Fetcher = async (req) => {
+			calls.push(req);
+			return jsonResponse(201, { id: "s1", token: "TOK", url: "https://web/share/TOK", permission: "edit", expires_at: "2026-07-01T00:00:00.000Z" });
+		};
+		const api = new MayaspaceApi("https://api.test", auth, fetcher);
+		const out = await api.createShare("o1", "f1", { permission: "edit", expiresAt: "2026-07-01T00:00:00.000Z" });
+		expect(out.token).toBe("TOK");
+		expect(out.url).toContain("/share/TOK");
+		expect(calls[0].method).toBe("POST");
+		expect(calls[0].url).toContain("/v1/orgs/o1/files/f1/shares");
+		expect(JSON.parse(calls[0].body as string)).toEqual({ permission: "edit", expires_at: "2026-07-01T00:00:00.000Z" });
+	});
+
+	test("createShare: 만료 없으면 expires_at 생략", async () => {
+		const { auth } = await authedAuth();
+		const calls: HttpRequest[] = [];
+		const fetcher: Fetcher = async (req) => { calls.push(req); return jsonResponse(201, { id: "s2", token: "T2", url: "u", permission: "read", expires_at: null }); };
+		const api = new MayaspaceApi("https://api.test", auth, fetcher);
+		await api.createShare("o1", "f1", { permission: "read" });
+		expect(JSON.parse(calls[0].body as string)).toEqual({ permission: "read" });
+	});
+
+	test("listShares: GET .../files/:fid/shares returns shares", async () => {
+		const { auth } = await authedAuth();
+		const fetcher: Fetcher = async (req) => {
+			expect(req.url).toContain("/v1/orgs/o1/files/f1/shares");
+			return jsonResponse(200, { shares: [{ id: "s1", permission: "edit", expires_at: null, created_at: "2026-06-20T00:00:00Z" }] });
+		};
+		const api = new MayaspaceApi("https://api.test", auth, fetcher);
+		expect((await api.listShares("o1", "f1")).map((s) => s.id)).toEqual(["s1"]);
+	});
+
+	test("revokeShare: DELETE .../shares/:sid", async () => {
+		const { auth } = await authedAuth();
+		const calls: HttpRequest[] = [];
+		const fetcher: Fetcher = async (req) => { calls.push(req); return jsonResponse(204, {}); };
+		const api = new MayaspaceApi("https://api.test", auth, fetcher);
+		await api.revokeShare("o1", "s1");
+		expect(calls[0].method).toBe("DELETE");
+		expect(calls[0].url).toContain("/v1/orgs/o1/shares/s1");
+	});
+
 	test("me(): GET /v1/auth/me", async () => {
 		const { auth } = await authedAuth();
 		const fetcher: Fetcher = async () => jsonResponse(200, { id: "u1", email: "alice@example.com", deviceId: "d1" });
