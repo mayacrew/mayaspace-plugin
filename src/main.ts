@@ -43,6 +43,7 @@ import { MayaspaceEvents } from "./events/sse-subscriber";
 import { makePeerIdentity } from "./ui/peer-identity";
 import { ExplorerDecorator, type SyncStatus } from "./ui/explorer-decorator";
 import { CollabSidebarView, VIEW_TYPE_COLLAB, type CollabSidebarCallbacks } from "./ui/collab-sidebar";
+import { ShareCreateModal, ShareManageModal } from "./ui/share-modal";
 
 import { parseMayaspacePath, sanitizeFolderName, canonicalServerPath } from "./lib/path";
 import { READ, UPDATE, CREATE, DELETE, can } from "./lib/permissions";
@@ -455,6 +456,34 @@ export default class MayaspacePlugin extends Plugin {
 			name: "MayaSpace: Check server capabilities",
 			callback: () => this.smokeCheckCapabilities(),
 		});
+		this.addCommand({
+			id: "share-link",
+			name: "MayaSpace: 링크로 공유",
+			callback: () => {
+				if (!this.settings.tokenSet) { new Notice("먼저 로그인하세요."); return; }
+				const m = this.activeNoteMapping();
+				if (!m) { new Notice("동기화된 노트에서 실행하세요."); return; }
+				new ShareCreateModal(this.app, this.api, m.orgId, m.fileId, m.path).open();
+			},
+		});
+		this.addCommand({
+			id: "manage-shares",
+			name: "MayaSpace: 공유 관리",
+			callback: () => {
+				if (!this.settings.tokenSet) { new Notice("먼저 로그인하세요."); return; }
+				const m = this.activeNoteMapping();
+				if (!m) { new Notice("동기화된 노트에서 실행하세요."); return; }
+				new ShareManageModal(this.app, this.api, m.orgId, m.fileId).open();
+			},
+		});
+	}
+
+	/** 활성 마크다운 노트의 org/fileId 매핑(미동기화면 null). */
+	private activeNoteMapping(): { orgId: string; fileId: string; path: string } | null {
+		const active = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!active?.file) return null;
+		const m = this.settings.fileMappings[active.file.path];
+		return m ? { orgId: m.orgId, fileId: m.fileId, path: active.file.path } : null;
 	}
 
 	// ---------- Workspace / Vault handlers ----------
