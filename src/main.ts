@@ -537,6 +537,29 @@ export default class MayaspacePlugin extends Plugin {
 				this.decorator.refresh();
 			}),
 		);
+
+		// 탐색기 우클릭 → 공유. 로그인·동기화(매핑)된 노트에서만 항목을 띄운다.
+		// read/edit별 권한 검증은 서버(create)에 맡기므로 여기서 UPDATE로 막지 않는다.
+		this.registerEvent(
+			this.app.workspace.on("file-menu", (menu, file) => {
+				if (!(file instanceof TFile) || !this.settings.tokenSet) return;
+				const mapping = this.mappings.getFile(file.path);
+				if (!mapping) return;
+				const { orgId, fileId } = mapping;
+				menu.addItem((item) =>
+					item
+						.setTitle("MayaSpace: 링크로 공유")
+						.setIcon("share-2")
+						.onClick(() => new ShareCreateModal(this.app, this.api, orgId, fileId, file.basename).open()),
+				);
+				menu.addItem((item) =>
+					item
+						.setTitle("MayaSpace: 공유 관리")
+						.setIcon("link")
+						.onClick(() => new ShareManageModal(this.app, this.api, orgId, fileId).open()),
+				);
+			}),
+		);
 	}
 
 	// NOTE: we deliberately do NOT eager-detach on every leaf change. Obsidian
