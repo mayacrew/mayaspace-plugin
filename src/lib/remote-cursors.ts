@@ -1,5 +1,5 @@
-import { Decoration, ViewPlugin, WidgetType } from "@codemirror/view";
-import type { DecorationSet, EditorView, ViewUpdate } from "@codemirror/view";
+import { Decoration, EditorView, ViewPlugin, WidgetType } from "@codemirror/view";
+import type { DecorationSet, ViewUpdate } from "@codemirror/view";
 import { Annotation } from "@codemirror/state";
 import type { Extension, Range } from "@codemirror/state";
 import { yRemoteSelectionsTheme } from "y-codemirror.next";
@@ -224,11 +224,17 @@ class RemoteCursorsPluginValue {
 	}
 }
 
+// yRemoteSelectionsTheme는 이름 라벨(cm-ySelectionInfo)을 opacity:0으로 두고 캐럿 hover 시에만
+// 보여준다. 공유 닉네임/로그인 아이디가 바로 뜨도록 항상 보이게 덮어쓴다(theme이 baseTheme보다 우선).
+const labelAlwaysVisible = EditorView.theme({
+	".cm-ySelectionInfo": { opacity: 1 },
+});
+
 // yCollab-binder가 ext에 추가. ySync(본문 동기화)와 독립적으로 원격 커서/선택만 담당.
 export function remoteCursors(handle: { doc: Y.Doc; awareness: unknown }): Extension {
 	const plugin = ViewPlugin.define(
 		(view) => new RemoteCursorsPluginValue(view, handle as YHandle),
 		{ decorations: (v) => v.decorations },
 	);
-	return [plugin, yRemoteSelectionsTheme];
+	return [plugin, yRemoteSelectionsTheme, labelAlwaysVisible];
 }
