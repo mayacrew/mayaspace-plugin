@@ -17,6 +17,7 @@ import { EditorView } from "@codemirror/view";
 import { ySync, ySyncFacet, YSyncConfig } from "y-codemirror.next";
 import * as Y from "yjs";
 import { detachYExtension } from "./editor-binding";
+import { remoteCursors } from "../lib/remote-cursors";
 import type { PeerIdentity } from "../ui/peer-identity";
 
 export interface YCollabHandle {
@@ -36,16 +37,21 @@ export function bindYCollab(
 
 	handle.awareness.setLocalStateField("user", identity);
 
-	// Build the content-sync core WITHOUT yCollab's yRemoteSelections. That
-	// plugin's update() calls editor.doc.lineAt(index) with an index resolved
-	// against the shared Y.Doc; when the local editor lags ytext (Korean IME
-	// composition defers CodeMirror transactions while remote edits stream in)
-	// the index exceeds the editor doc length → RangeError → the ViewPlugin
-	// dies and the client stops applying remote updates (one-sided desync).
-	// Dropping remote-cursor rendering removes the crash; content sync stays.
+	// Content sync via ySync. Remote cursors/selections via our own clamped
+	// plugin (remoteCursors) — NOT yCollab's bundled yRemoteSelections, whose
+	// update() called editor.doc.lineAt(index) with an index resolved against
+	// the shared Y.Doc; during Korean IME lag that index exceeded the local doc
+	// length → RangeError → ViewPlugin death → one-sided desync (5f90a45).
+	// remoteCursors clamps every remote index to [0, doc.length], skips repaint
+	// during IME composition, and wraps decoration build in try/catch so a bad
+	// remote state can never kill the plugin (src/lib/remote-cursors.ts).
 	// readOnly: 사용자 키 입력은 막되(editable=false) ySync가 적용하는 원격 업데이트는
 	// 프로그램적 dispatch라 그대로 반영된다 → "쓰기 금지, 서버 내용은 계속 수신".
-	const ext = [ySyncFacet.of(new YSyncConfig(ytext, handle.awareness)), ySync];
+	const ext = [
+		ySyncFacet.of(new YSyncConfig(ytext, handle.awareness)),
+		ySync,
+		remoteCursors(handle),
+	];
 	if (opts.readOnly) {
 		ext.push(EditorState.readOnly.of(true), EditorView.editable.of(false));
 	}
