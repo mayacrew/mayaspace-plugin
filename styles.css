@@ -339,3 +339,21 @@
 	text-align: center;
 	padding: 12px 0;
 }
+
+/* ---------- 본문 하이드레이션 배지 ---------- */
+/* org 마커(::before "↖")를 상태 글리프로 덮는다(클래스 2개라 우선순위가 기본을 이김).
+   local은 덮지 않으므로 기본 "↖" 유지 = 없는 것만 표시. sync 배지(::after)와 무충돌. */
+.mayaspace-org-file.mayaspace-content-placeholder .nav-file-title-content::before,
+.mayaspace-org-file.mayaspace-content-placeholder .nav-folder-title-content::before {
+	content: "☁ ";
+	color: var(--text-faint);
+}
+.mayaspace-org-file.mayaspace-content-hydrating .nav-file-title-content::before,
+.mayaspace-org-file.mayaspace-content-hydrating .nav-folder-title-content::before {
+	content: "↓ ";
+	color: var(--interactive-accent);
+}
+/* 아직 본문이 없는 파일은 흐리게(클라우드 전용 느낌) */
+.mayaspace-content-placeholder .nav-file-title-content {
+	opacity: 0.6;
+}

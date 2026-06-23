@@ -41,7 +41,7 @@ import { TreePoller, type PollerVault } from "./vault/tree-poller";
 import { MayaspaceEvents } from "./events/sse-subscriber";
 
 import { makePeerIdentity } from "./ui/peer-identity";
-import { ExplorerDecorator, type SyncStatus } from "./ui/explorer-decorator";
+import { ExplorerDecorator, type SyncStatus, type ContentState } from "./ui/explorer-decorator";
 import { CollabSidebarView, VIEW_TYPE_COLLAB, type CollabSidebarCallbacks } from "./ui/collab-sidebar";
 import { TrashModal } from "./ui/trash-modal";
 import { ShareCreateModal, ShareManageModal } from "./ui/share-modal";
@@ -98,6 +98,10 @@ export default class MayaspacePlugin extends Plugin {
 	// 벌크 업로드 진행률 전용 아이템. 계정 상태바(saveSettings가 갱신)와 분리해 충돌을 막는다.
 	private uploadStatusItem: HTMLElement | null = null;
 	private fileStatuses: Record<string, SyncStatus> = {};
+	// 본문 hydrate 진행 중인 경로(배지 hydrating 표시용).
+	private readonly hydratingPaths = new Set<string>();
+	// 대형 vault background drip 타이머(없으면 null).
+	private hydrateDripTimer: number | null = null;
 	private settingTab: MayaspaceSettingTab | null = null;
 	private prefetches = new Map<string, () => void>();
 	// Most-recently-opened mapped paths, newest last. Bounds the live prefetch
@@ -192,6 +196,7 @@ export default class MayaspacePlugin extends Plugin {
 		this.treePoller?.stop();
 		if (this.fileOpenTimer) clearTimeout(this.fileOpenTimer);
 		this.events?.unsubscribeAll();
+		this.stopBackgroundHydrate();
 		this.stopAllPrefetches();
 		await this.liveCollab.detachAll();
 		await this.sync.closeAll();
@@ -252,6 +257,8 @@ export default class MayaspacePlugin extends Plugin {
 				status === "connecting" ? "syncing" : "offline";
 			this.fileStatuses[path] = display;
 			this.decorator?.updateStatus(path, display);
+			// 협업 연결로 본문이 디스크에 채워지므로 content 배지도 함께 갱신한다.
+			this.decorator?.updateContent(path, this.contentStateFor(path));
 		});
 	}
 
@@ -269,6 +276,7 @@ export default class MayaspacePlugin extends Plugin {
 		this.events = null;
 		this.treePoller?.stop();
 		this.treePoller = null;
+		this.stopBackgroundHydrate();
 		this.stopAllPrefetches();
 		await this.liveCollab.detachAll();
 		await this.sync.closeAll();
@@ -305,6 +313,7 @@ export default class MayaspacePlugin extends Plugin {
 		this.decorator = new ExplorerDecorator(this.app, {
 			getOrgFilePaths: () => Object.keys(this.settings.fileMappings),
 			getStatuses: () => this.fileStatuses,
+			getContentStates: () => this.computeContentStates(),
 		});
 	}
 
@@ -697,6 +706,7 @@ export default class MayaspacePlugin extends Plugin {
 		this.events = null;
 		this.treePoller?.stop();
 		this.treePoller = null;
+		this.stopBackgroundHydrate();
 		this.stopAllPrefetches();
 		await this.liveCollab.detachAll();
 		await this.sync.closeAll();
@@ -836,12 +846,81 @@ export default class MayaspacePlugin extends Plugin {
 		const entries = Object.entries(this.settings.fileMappings).filter(
 			([path]) => !this.liveCollab.activePaths().includes(path),
 		);
+		// 대형 vault: 동기화 시 일괄 read를 폐지하고 background drip + 열 때 채우기(lazy)로 전환한다.
+		// 받는 N명이 한꺼번에 전체 본문을 당기면 outbound가 터지므로(예: 1만 파일×30명).
+		if (entries.length > this.settings.lazyHydrateThreshold) {
+			this.startBackgroundHydrate();
+			return;
+		}
+		// 작은 vault: 기존 eager — 본문을 미리 받아 네이티브 검색/그래프가 바로 동작하게.
 		// Bounded concurrency: a large vault would otherwise either fire one REST
 		// read per file at once (connection flood) or crawl one-at-a-time. Run a
 		// small fixed number of workers over a shared queue.
 		await runBounded(HYDRATE_CONCURRENCY, entries, ([path, mapping]) =>
-			this.hydrateFile(path, mapping),
+			this.hydrateFileTracked(path, mapping),
 		);
+	}
+
+	/** hydrate를 감싸 진행 상태를 배지에 반영한다(시작=hydrating, 완료=파생). */
+	private async hydrateFileTracked(path: string, mapping: FileMapping): Promise<void> {
+		this.hydratingPaths.add(path);
+		this.decorator?.updateContent(path, "hydrating");
+		try {
+			await this.hydrateFile(path, mapping);
+		} finally {
+			this.hydratingPaths.delete(path);
+			this.decorator?.updateContent(path, this.contentStateFor(path));
+		}
+	}
+
+	/** 대형 vault용: 한가할 때 placeholder를 분당 N개씩 천천히 채운다(드립). */
+	private startBackgroundHydrate(): void {
+		if (this.hydrateDripTimer !== null) return; // 이미 도는 중
+		if (!this.nextPlaceholderToHydrate()) return; // 받을 게 없으면 시작 안 함
+		const perMinute = Math.max(1, this.settings.backgroundHydratePerMinute);
+		const intervalMs = Math.max(1000, Math.floor(60000 / perMinute));
+		this.hydrateDripTimer = window.setInterval(() => void this.dripHydrateOnce(), intervalMs);
+		this.registerInterval(this.hydrateDripTimer);
+	}
+
+	private stopBackgroundHydrate(): void {
+		if (this.hydrateDripTimer === null) return;
+		window.clearInterval(this.hydrateDripTimer);
+		this.hydrateDripTimer = null;
+	}
+
+	private async dripHydrateOnce(): Promise<void> {
+		const next = this.nextPlaceholderToHydrate();
+		if (!next) { this.stopBackgroundHydrate(); return; }
+		await this.hydrateFileTracked(next[0], next[1]);
+	}
+
+	/** 아직 본문이 없는(placeholder) 첫 매핑 파일. 없으면 null. */
+	private nextPlaceholderToHydrate(): [string, FileMapping] | null {
+		for (const [path, mapping] of Object.entries(this.settings.fileMappings)) {
+			if (this.hydratingPaths.has(path)) continue;
+			if (this.liveCollab.activePaths().includes(path)) continue;
+			if (this.contentStateFor(path) === "placeholder") return [path, mapping];
+		}
+		return null;
+	}
+
+	/** 파일 한 개의 본문 상태(배지용). 받는 중=hydrating, 라이브 세션·size>0=local, 그 외=placeholder. */
+	private contentStateFor(path: string): ContentState {
+		if (this.hydratingPaths.has(path)) return "hydrating";
+		// 라이브 협업 중이면 본문이 에디터에 있으므로 디스크 쓰기 지연과 무관하게 local로 본다.
+		if (this.liveCollab?.activePaths().includes(path)) return "local";
+		const file = this.app.vault.getAbstractFileByPath(path);
+		return file instanceof TFile && file.stat.size > 0 ? "local" : "placeholder";
+	}
+
+	/** 매핑된 전 파일의 본문 상태 맵(데코레이터 refresh용). */
+	private computeContentStates(): Record<string, ContentState> {
+		const out: Record<string, ContentState> = {};
+		for (const path of Object.keys(this.settings.fileMappings)) {
+			out[path] = this.contentStateFor(path);
+		}
+		return out;
 	}
 
 	private async hydrateFile(path: string, mapping: FileMapping): Promise<void> {

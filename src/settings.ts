@@ -22,6 +22,10 @@ export interface MayaspaceSettings {
 	prefetchAllFiles: boolean;
 	/** How many recently-opened files keep a live prefetch session. */
 	livePrefetchLimit: number;
+	/** vault에 이 수를 넘는 파일이 매핑되면 동기화 시 일괄 hydrate 대신 lazy + background drip. */
+	lazyHydrateThreshold: number;
+	/** 대형 vault에서 background drip이 분당 채우는 placeholder 수. */
+	backgroundHydratePerMinute: number;
 	tokenSet: TokenSet | null;
 	accountEmail: string | null;
 	/** sanitized org folder name → orgId */
@@ -43,6 +47,8 @@ export const DEFAULT_SETTINGS: MayaspaceSettings = {
 	treePollIntervalSec: 30,
 	prefetchAllFiles: false,
 	livePrefetchLimit: 20,
+	lazyHydrateThreshold: 500,
+	backgroundHydratePerMinute: 30,
 	tokenSet: null,
 	accountEmail: null,
 	orgMappings: {},
@@ -199,6 +205,34 @@ export class MayaspaceSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.prefetchAllFiles)
 					.onChange(async (v) => {
 						this.plugin.settings.prefetchAllFiles = v;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(root)
+			.setName("Lazy hydrate threshold (files)")
+			.setDesc("매핑 파일이 이 수를 넘으면 동기화 시 본문을 한 번에 받지 않고, 열 때 + 백그라운드로 천천히 받습니다(대용량 outbound 폭탄 방지). 작은 vault는 기존대로 한 번에 받습니다.")
+			.addText((t) =>
+				t
+					.setPlaceholder("500")
+					.setValue(String(this.plugin.settings.lazyHydrateThreshold))
+					.onChange(async (v) => {
+						const n = Number.parseInt(v, 10);
+						this.plugin.settings.lazyHydrateThreshold = Number.isFinite(n) && n >= 0 ? n : 500;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(root)
+			.setName("Background hydrate (files / min)")
+			.setDesc("대용량 vault에서 아직 안 받은 파일을 백그라운드로 분당 몇 개씩 채울지.")
+			.addText((t) =>
+				t
+					.setPlaceholder("30")
+					.setValue(String(this.plugin.settings.backgroundHydratePerMinute))
+					.onChange(async (v) => {
+						const n = Number.parseInt(v, 10);
+						this.plugin.settings.backgroundHydratePerMinute = Number.isFinite(n) && n >= 1 ? n : 30;
 						await this.plugin.saveSettings();
 					}),
 			);
