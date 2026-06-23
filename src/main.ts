@@ -94,6 +94,10 @@ export default class MayaspacePlugin extends Plugin {
 	private readonly resyncOnAccessChange = debounce(() => {
 		void this.syncTrees().catch((e) => console.warn("[mayaspace] access.changed resync", e));
 	}, 800);
+	// 서버 tree.changed 신호(I1 burst coalesce) → 트리 재동기화. 디바운스로 묶는다.
+	private readonly resyncOnTreeChange = debounce(() => {
+		void this.syncTrees().catch((e) => console.warn("[mayaspace] tree.changed resync", e));
+	}, 800);
 	private statusBarItem: HTMLElement | null = null;
 	// 벌크 업로드 진행률 전용 아이템. 계정 상태바(saveSettings가 갱신)와 분리해 충돌을 막는다.
 	private uploadStatusItem: HTMLElement | null = null;
@@ -1415,6 +1419,8 @@ export default class MayaspacePlugin extends Plugin {
 				},
 				// 권한 변경 신호: 30초 폴러를 기다리지 않고 즉시(디바운스) 권한 재동기화.
 				onAccessChanged: () => this.resyncOnAccessChange(),
+				// 트리 무효화 신호(대량 burst coalesce): 디바운스 트리 재동기화.
+				onTreeChanged: () => this.resyncOnTreeChange(),
 				onError: (orgId, e) => console.warn("[mayaspace] SSE error", orgId, e),
 			},
 		});

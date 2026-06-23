@@ -63,6 +63,8 @@ export interface EventsHandlers {
 	onPresenceChanged?: (p: PresenceChangedEvent) => void | Promise<void>;
 	/** 조직 권한 변경 신호. 클라가 즉시 권한을 재동기화(syncTrees)하도록 트리거. */
 	onAccessChanged?: (orgId: string) => void | Promise<void>;
+	/** 대량 burst를 묶은 트리 무효화 신호(I1). 클라가 트리를 재동기화(syncTrees)하도록 트리거. */
+	onTreeChanged?: (orgId: string) => void | Promise<void>;
 	onError?: (orgId: string, e: unknown) => void;
 }
 
@@ -154,6 +156,12 @@ export class MayaspaceEvents {
 		// 권한 변경 신호. payload보다 구독 시점의 orgId가 권위적이라 그대로 넘긴다(deviceId 필터 없음).
 		es.addEventListener("access.changed", () => {
 			Promise.resolve(this.opts.handlers.onAccessChanged?.(orgId)).catch((err) =>
+				this.opts.handlers.onError?.(orgId, err),
+			);
+		});
+		// 트리 무효화 신호(I1 burst coalesce). payload 없이 구독 orgId로 트리 재동기화.
+		es.addEventListener("tree.changed", () => {
+			Promise.resolve(this.opts.handlers.onTreeChanged?.(orgId)).catch((err) =>
 				this.opts.handlers.onError?.(orgId, err),
 			);
 		});

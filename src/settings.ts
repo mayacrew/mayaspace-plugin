@@ -46,7 +46,7 @@ export const DEFAULT_SETTINGS: MayaspaceSettings = {
 	mayaspaceRoot: "MayaSpace",
 	treePollIntervalSec: 30,
 	prefetchAllFiles: false,
-	livePrefetchLimit: 20,
+	livePrefetchLimit: 5,
 	lazyHydrateThreshold: 500,
 	backgroundHydratePerMinute: 30,
 	tokenSet: null,
@@ -205,6 +205,20 @@ export class MayaspaceSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.prefetchAllFiles)
 					.onChange(async (v) => {
 						this.plugin.settings.prefetchAllFiles = v;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(root)
+			.setName("Live prefetch limit (files)")
+			.setDesc("최근 연 파일 중 실시간 세션(WS)을 유지할 개수. 낮을수록 서버 연결·메모리 절약(기본 5, '열린 문서 중심').")
+			.addText((t) =>
+				t
+					.setPlaceholder("5")
+					.setValue(String(this.plugin.settings.livePrefetchLimit))
+					.onChange(async (v) => {
+						const n = Number.parseInt(v, 10);
+						this.plugin.settings.livePrefetchLimit = Number.isFinite(n) && n >= 0 ? n : 5;
 						await this.plugin.saveSettings();
 					}),
 			);
