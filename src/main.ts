@@ -47,6 +47,7 @@ import { TrashModal } from "./ui/trash-modal";
 import { ShareCreateModal, ShareManageModal } from "./ui/share-modal";
 
 import { parseMayaspacePath, sanitizeFolderName, canonicalServerPath } from "./lib/path";
+import { inheritedPermsForPath } from "./lib/path-perms";
 import { READ, UPDATE, CREATE, DELETE, can } from "./lib/permissions";
 import { isImagePath, bytesToBase64, MAX_IMAGE_BYTES, makeRand4, decideImageDrop } from "./lib/attachments";
 import { checkCreate, checkUpdate, checkDelete, checkMove } from "./permissions/permission-guard";
@@ -1852,14 +1853,15 @@ export default class MayaspacePlugin extends Plugin {
 
 	/** 신규 파일(아직 fileId 없음): 같은 폴더 형제 파일의 perms로 추론, 없으면 org 루트 폴백. */
 	private permsForNewPath(orgId: string, fullPath: string): number {
-		const parent = fullPath.slice(0, fullPath.lastIndexOf("/"));
-		for (const [p, m] of Object.entries(this.settings.fileMappings)) {
-			if (m.orgId !== orgId) continue;
-			if (p.slice(0, p.lastIndexOf("/")) !== parent) continue;
-			const sib = this.settings.filePermissions[m.fileId];
-			if (sib !== undefined) return sib;
-		}
-		return this.settings.orgPermissions[orgId] ?? 0;
+		// 서버 ACL은 경로 prefix로 상속된다 — 가장 가까운 조상 폴더의 권한을 물려받는다(없으면 org 루트).
+		// 직속 형제만 보면 폴더째 드래그로 생긴 새 하위폴더 파일이 루트로 잘못 폴백돼 막혔다(회귀).
+		return inheritedPermsForPath(
+			orgId,
+			fullPath,
+			this.settings.fileMappings,
+			this.settings.filePermissions,
+			this.settings.orgPermissions[orgId] ?? 0,
+		);
 	}
 
 	/** 그룹 C(사이드바)용 공개 헬퍼: relPath 기준 유효 권한. 매핑 있으면 fileId, 없으면 폴더 추론. */
