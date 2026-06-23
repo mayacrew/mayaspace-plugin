@@ -91,6 +91,8 @@ export default class MayaspacePlugin extends Plugin {
 	private treePoller: TreePoller | null = null;
 	// 동시 syncTrees 실행 방지 플래그.
 	private syncingTrees = false;
+	// 마지막 tree.changed(벌크 coalesce) 수신 시각 — 폴러 삭제 보류 창 계산용.
+	private lastTreeChangeAt = 0;
 	// 서버 access.changed 신호 → 권한 즉시 재동기화. 짧게 몰아쳐도 한 번만 돌도록 디바운스.
 	private readonly resyncOnAccessChange = debounce(() => {
 		void this.syncTrees().catch((e) => console.warn("[mayaspace] access.changed resync", e));
@@ -1130,6 +1132,9 @@ export default class MayaspacePlugin extends Plugin {
 				},
 				sanitizeOrgFolderName: sanitizeFolderName,
 				mayaspaceRoot: () => this.settings.mayaspaceRoot,
+				// 동기화 진행 중 또는 tree.changed 직후 창에선 삭제 판정을 건너뛴다 — 벌크 수신 중
+				// 매핑 flux를 다른 시점 트리와 비교해 멀쩡한 파일을 손실로 오판하는 것을 막는다.
+				isSyncing: () => this.syncingTrees || Date.now() - this.lastTreeChangeAt < POLLER_DELETE_FREEZE_MS,
 				// Same diff+detach logic as syncTrees — admin's permission changes
 				// must reach the plugin via the periodic poll, not just on next login.
 				onOrgPermissions: (perms) => this.applyOrgPermissions(perms),
@@ -1420,8 +1425,11 @@ export default class MayaspacePlugin extends Plugin {
 				},
 				// 권한 변경 신호: 30초 폴러를 기다리지 않고 즉시(디바운스) 권한 재동기화.
 				onAccessChanged: () => this.resyncOnAccessChange(),
-				// 트리 무효화 신호(대량 burst coalesce): 디바운스 트리 재동기화.
-				onTreeChanged: () => this.resyncOnTreeChange(),
+				// 트리 무효화 신호(대량 burst coalesce): 디바운스 트리 재동기화 + 폴러 삭제 보류 창 갱신.
+				onTreeChanged: () => {
+					this.lastTreeChangeAt = Date.now();
+					this.resyncOnTreeChange();
+				},
 				onError: (orgId, e) => console.warn("[mayaspace] SSE error", orgId, e),
 			},
 		});
@@ -1922,6 +1930,11 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 // Debounce for file-open → live-collab (re)bind. Long enough to coalesce rapid
 // in-leaf file switching, short enough to feel instant once the user settles.
 const FILE_OPEN_DEBOUNCE_MS = 150;
+
+// tree.changed(I1 벌크 coalesce) 직후 이 창 동안엔 폴러의 삭제 판정을 보류한다.
+// 벌크 수신은 디바운스된 syncTrees가 여러 번 몰아치며 공유 매핑을 갱신하므로, 그 사이
+// 빈틈에 폴이 돌아 멀쩡한 파일을 손실로 오판하지 않게 한다(디바운스 800ms + 동기화 시간 여유).
+const POLLER_DELETE_FREEZE_MS = 10000;
 
 /**
  * Run `worker` over `items` with at most `limit` in flight at once. A shared
