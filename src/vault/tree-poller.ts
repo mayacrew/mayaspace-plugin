@@ -41,6 +41,12 @@ export interface PollerHooks {
 	onFilePermissions?(fileId: string, perms: number): void;
 	/** 권한 회수/서버 삭제로 로컬 파일을 지우기 직전 호출. prefetch 중단·detach·Notice용. */
 	onFileLost?(path: string, mapping: { orgId: string; fileId: string }): void;
+	/**
+	 * 트리 동기화(syncTrees)가 진행 중이거나 직후인지. true면 이번 틱의 삭제 판정을 건너뛴다.
+	 * 동기화는 공유 매핑을 대량 갱신하는 중이라, 폴러가 그 도중 스냅샷과 다른 시점의 트리를
+	 * 비교하면 서버에 멀쩡히 있는 파일을 손실로 오판한다(벌크 수신측 onFileLost 폭주의 한 축).
+	 */
+	isSyncing?(): boolean;
 	onError?(e: unknown): void;
 }
 
@@ -97,7 +103,7 @@ export class TreePoller {
 		const serverFileIds = new Set<string>();
 		for (const file of tree) {
 			const fullPath = `${orgFolder}/${file.path}`;
-			serverPaths.add(fullPath);
+			serverPaths.add(fullPath.normalize("NFC")); // 손실 판정은 NFC로 비교(아래 classifyKnownMappings 참조)
 			serverFileIds.add(file.id);
 			this.hooks.onFilePermissions?.(file.id, file.effective_permissions ?? 0);
 			const known = this.hooks.getKnownFiles()[fullPath];
@@ -116,24 +122,23 @@ export class TreePoller {
 			}
 		}
 
+		// 삭제 판정은 트리 동기화가 진행 중/직후면 통째로 건너뛴다. 동기화가 공유 매핑을 대량
+		// 갱신하는 중엔 폴러가 그 도중 매핑 스냅샷을 다른 시점의 트리와 비교해 멀쩡한 파일을
+		// 손실로 오판하기 때문이다(벌크 수신측 onFileLost 폭주). add-loop은 위에서 이미 돌았다.
+		if (this.hooks.isSyncing?.()) return;
+
 		// Deletions: known mappings for this org whose path is no longer on the server tree.
 		// A MOVED file keeps its fileId at a new path — skip it (move, not loss). The old path
 		// drops out of serverPaths but the fileId is still present; treating it as a loss would
 		// purgeDoc the still-live doc and race the new path's session. The add-loop above already
 		// created the new-path mapping; onMoved (SSE) handles the rename, this only covers the race.
-		const known = this.hooks.getKnownFiles();
-		const moved: Array<[string, { orgId: string; fileId: string }]> = [];
-		const lost: Array<[string, { orgId: string; fileId: string }]> = [];
-		let knownInOrg = 0;
-		for (const [path, mapping] of Object.entries(known)) {
-			if (mapping.orgId !== org.id) continue;
-			if (!path.startsWith(orgFolder + "/")) continue;
-			knownInOrg++;
-			if (serverPaths.has(path)) continue;
-			// fileId가 트리에 여전히 있으면 이동(손실 아님): 옛 경로만 정리, onFileLost는 부르지 않는다
-			// (still-live doc purge는 새 경로 세션을 죽이고 IndexedDB 영속화와 레이스).
-			(serverFileIds.has(mapping.fileId) ? moved : lost).push([path, mapping]);
-		}
+		const { moved, lost, knownInOrg } = classifyKnownMappings(
+			this.hooks.getKnownFiles(),
+			serverPaths,
+			serverFileIds,
+			org.id,
+			orgFolder,
+		);
 
 		// 이동: 옛 경로 정리. 매핑을 먼저 지운 뒤 vault.delete(서버 DELETE 전파 방지). onFileLost 없음.
 		for (const [path] of moved) {
@@ -177,6 +182,50 @@ export class TreePoller {
 function isAlreadyExists(e: unknown): boolean {
 	const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
 	return msg.includes("already exists");
+}
+
+interface KnownMapping {
+	orgId: string;
+	fileId: string;
+}
+
+export interface KnownClassification {
+	/** fileId는 트리에 남아 있고 경로만 빠진 것(이동) — 옛 경로만 정리, 손실 아님. */
+	moved: Array<[string, KnownMapping]>;
+	/** 경로도 fileId도 트리에 없는 것(진짜 회수/삭제). */
+	lost: Array<[string, KnownMapping]>;
+	/** 이 org 폴더 안의 알려진 매핑 수(대량삭제 가드 분모). */
+	knownInOrg: number;
+}
+
+/**
+ * 알려진 매핑을 서버 트리와 대조해 present/moved/lost로 분류한다(순수).
+ *
+ * 경로는 **NFC로 정규화**해 비교한다 — macOS는 한글 파일명을 NFD로 다루는데(매핑 키가 NFD),
+ * 서버 트리 경로(NFC)와 byte 그대로 비교하면 같은 파일이 손실/이동으로 오판돼 로컬에서 잘못
+ * 삭제된다. tree-sync의 `findUnmappedLocalFiles`가 같은 이유로 같은 정규화를 한다.
+ * `serverPaths`는 NFC로 정규화된 집합이어야 한다. `serverFileIds`는 UUID(ASCII)라 정규화 불필요.
+ */
+export function classifyKnownMappings(
+	known: Record<string, KnownMapping>,
+	serverPaths: Set<string>,
+	serverFileIds: Set<string>,
+	orgId: string,
+	orgFolder: string,
+): KnownClassification {
+	const moved: Array<[string, KnownMapping]> = [];
+	const lost: Array<[string, KnownMapping]> = [];
+	let knownInOrg = 0;
+	const orgPrefix = `${orgFolder}/`.normalize("NFC");
+	for (const [path, mapping] of Object.entries(known)) {
+		if (mapping.orgId !== orgId) continue;
+		const nfc = path.normalize("NFC");
+		if (!nfc.startsWith(orgPrefix)) continue;
+		knownInOrg++;
+		if (serverPaths.has(nfc)) continue;
+		(serverFileIds.has(mapping.fileId) ? moved : lost).push([path, mapping]);
+	}
+	return { moved, lost, knownInOrg };
 }
 
 // 폴 1회에 이만큼(절대치) 이상이고 동시에 org 알려진 파일의 이 비율 이상이 삭제 후보면 "대량"으로 본다.
