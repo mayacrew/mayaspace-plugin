@@ -9,7 +9,7 @@
  * 데이터를 요청한다 (sync 레이어 직접 import 금지).
  */
 
-import { ItemView, MarkdownRenderer, Modal, WorkspaceLeaf } from "obsidian";
+import { ItemView, MarkdownRenderer, Modal, setIcon, WorkspaceLeaf } from "obsidian";
 import type { FileAccessMember, FileHistoryEntry, VersionContent, VersionListItem } from "../api/mayaspace-api";
 import { diffRows, diffWords, collapseRows } from "../lib/markdown-diff";
 import type { DiffRow, WordPart } from "../lib/markdown-diff";
@@ -37,6 +37,12 @@ export interface CollabSidebarCallbacks {
 	deleteVersion: (orgId: string, fileId: string, versionId: string) => Promise<void>;
 	/** 복원 성공 후 해당 파일을 재하이드레이션 (서버 본문 반영). */
 	onRestored: (orgId: string, fileId: string, filePath: string) => void;
+	/** 현재 파일을 외부 공유 링크로 만든다. */
+	openShare: (orgId: string, fileId: string, filePath: string) => void;
+	/** 현재 파일의 활성 공유를 관리한다. */
+	openManageShares: (orgId: string, fileId: string) => void;
+	/** 삭제된 파일 복구(휴지통) 모달을 연다 — 전체 조직 대상. */
+	openTrash: () => void;
 }
 
 interface FileContext {
@@ -98,7 +104,10 @@ export class CollabSidebarView extends ItemView {
 	private render(): void {
 		const root = this.contentEl;
 		root.empty();
-		root.createEl("h4", { text: "MayaSpace 협업" });
+
+		const header = root.createDiv({ cls: "mayaspace-collab-header" });
+		header.createEl("h4", { text: "MayaSpace 협업", cls: "mayaspace-collab-title" });
+		this.renderToolbar(header);
 
 		if (!this.ctx) {
 			root.createEl("p", { text: "MayaSpace 파일을 열면 협업 정보가 표시됩니다.", cls: "mayaspace-collab-empty" });
@@ -108,6 +117,30 @@ export class CollabSidebarView extends ItemView {
 		this.renderMembersSection(root);
 		this.renderHistorySection(root);
 		this.renderVersionsSection(root);
+	}
+
+	/** 헤더 우측 빠른 작업 — 공유/공유관리는 열린 파일이 있을 때만 활성. 휴지통·새로고침은 항상. */
+	private renderToolbar(parent: HTMLElement): void {
+		const toolbar = parent.createDiv({ cls: "mayaspace-collab-toolbar" });
+		const hasFile = !!this.ctx;
+
+		this.addToolButton(toolbar, "share-2", "공유 링크 만들기", hasFile, () => {
+			if (this.ctx) this.callbacks.openShare(this.ctx.orgId, this.ctx.fileId, this.ctx.filePath);
+		});
+		this.addToolButton(toolbar, "link", "공유 관리", hasFile, () => {
+			if (this.ctx) this.callbacks.openManageShares(this.ctx.orgId, this.ctx.fileId);
+		});
+		this.addToolButton(toolbar, "trash-2", "삭제된 파일 복구", true, () => this.callbacks.openTrash());
+		this.addToolButton(toolbar, "refresh-cw", "새로고침", true, () => this.refresh());
+	}
+
+	private addToolButton(parent: HTMLElement, icon: string, tooltip: string, enabled: boolean, onClick: () => void): void {
+		const btn = parent.createEl("button", { cls: "mayaspace-collab-tool clickable-icon" });
+		setIcon(btn, icon);
+		btn.setAttr("aria-label", tooltip);
+		btn.title = tooltip;
+		btn.disabled = !enabled;
+		btn.onclick = onClick;
 	}
 
 	private renderMembersSection(root: HTMLElement): void {

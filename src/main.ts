@@ -383,6 +383,13 @@ export default class MayaspacePlugin extends Plugin {
 			onRestored: (orgId, fileId, filePath) => {
 				void this.rehydrateAfterRestore(orgId, fileId, filePath);
 			},
+			openShare: (orgId, fileId, filePath) => {
+				new ShareCreateModal(this.app, this.api, orgId, fileId, filePath).open();
+			},
+			openManageShares: (orgId, fileId) => {
+				new ShareManageModal(this.app, this.api, orgId, fileId).open();
+			},
+			openTrash: () => this.openTrashModal(),
 		};
 
 		this.registerView(VIEW_TYPE_COLLAB, (leaf) => {
@@ -460,12 +467,7 @@ export default class MayaspacePlugin extends Plugin {
 		this.addCommand({
 			id: "restore-deleted",
 			name: "MayaSpace: 삭제된 파일 복구",
-			callback: () => {
-				if (!this.settings.tokenSet) { new Notice("먼저 로그인하세요."); return; }
-				const orgs = Object.entries(this.settings.orgMappings).map(([folder, orgId]) => ({ folder, orgId }));
-				if (orgs.length === 0) { new Notice("동기화된 조직이 없습니다."); return; }
-				new TrashModal(this.app, this.api, orgs, () => void this.syncTrees().catch(() => {})).open();
-			},
+			callback: () => this.openTrashModal(),
 		});
 		this.addCommand({
 			id: "share-link",
@@ -487,6 +489,14 @@ export default class MayaspacePlugin extends Plugin {
 				new ShareManageModal(this.app, this.api, m.orgId, m.fileId).open();
 			},
 		});
+	}
+
+	/** 삭제된 파일 복구 모달 — 명령·사이드바 버튼 양쪽에서 호출. */
+	private openTrashModal(): void {
+		if (!this.settings.tokenSet) { new Notice("먼저 로그인하세요."); return; }
+		const orgs = Object.entries(this.settings.orgMappings).map(([folder, orgId]) => ({ folder, orgId }));
+		if (orgs.length === 0) { new Notice("동기화된 조직이 없습니다."); return; }
+		new TrashModal(this.app, this.api, orgs, () => void this.syncTrees().catch(() => {})).open();
 	}
 
 	/** 활성 마크다운 노트의 org/fileId 매핑(미동기화면 null). */

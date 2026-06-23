@@ -86,11 +86,12 @@ export class ShareManageModal extends Modal {
 				.setName(s.permission === "edit" ? "편집" : "읽기 전용")
 				.setDesc(s.expires_at ? `만료 ${new Date(s.expires_at).toLocaleString()}` : "무기한")
 				.addButton((b) =>
-					b.setButtonText("취소").setWarning().onClick(async () => {
+					b.setButtonText("공유 해제").setWarning().onClick(async () => {
 						try {
 							await this.api.revokeShare(this.orgId, s.id);
+							new Notice("공유 링크를 해제했습니다.");
 						} catch (e) {
-							new Notice(`취소 실패: ${(e as Error)?.message ?? e}`);
+							new Notice(`공유 해제 실패: ${(e as Error)?.message ?? e}`);
 						}
 						await this.render();
 					}),
