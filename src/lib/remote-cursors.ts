@@ -139,7 +139,13 @@ class RemoteCursorsPluginValue {
 
 	update(update: ViewUpdate): void {
 		this.writeLocalCursor(update);
-		if (update.view.composing) return; // 조합 중엔 기존 데코 유지(IME 방해 방지).
+		// IME 조합 중엔 재빌드(lineAt → 과거 RangeError 크래시 지점)를 피하되, 기존 데코를
+		// 변경분으로 매핑은 한다. 매핑을 안 하면 CodeMirror가 ViewPlugin 데코를 자동 remap하지
+		// 않으므로 조합 중 원격 커서가 문서 변경을 못 따라가 한 칸씩 어긋난다(고정→stale).
+		if (update.view.composing) {
+			if (update.docChanged) this.decorations = this.decorations.map(update.changes);
+			return;
+		}
 		this.decorations = this.build(update.view);
 	}
 
