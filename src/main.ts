@@ -24,7 +24,7 @@ import { ConfirmModal } from "./auth/confirm-modal";
 
 import { makeObsidianFetcher, type Fetcher } from "./api/mayaspace-http";
 import { MayaspaceApi, EtagMismatchError, type FileMeta } from "./api/mayaspace-api";
-import { isPathConflict, isTransientHttp } from "./api/http-errors";
+import { httpStatusOf, isPathConflict, isTransientHttp } from "./api/http-errors";
 
 import { MayaspaceSync, defaultHocuspocusFactory } from "./sync/mayaspace-sync";
 import { LiveCollabSession } from "./sync/live-collab-session";
@@ -1547,14 +1547,18 @@ export default class MayaspacePlugin extends Plugin {
 			try {
 				meta = await this.api.createFile(orgId, parsed.relPath, contentBase64);
 			} catch (e) {
-				// 이미 존재(409, 또는 일부 서버가 누설하는 duplicate-key 500)는 멱등하게 스킵.
+				// 이미 존재(409, 또는 일부 서버가 누설하는 duplicate-key 500)는 멱등하게 스킵 — 실패 아님.
 				if (isPathConflict(e)) {
 					console.log("[mayaspace] create skipped — server says path exists", path);
 					return;
 				}
-				// bulk(큐) 경로의 일시적 실패는 위로 던져 큐가 백오프 재시도하게 한다.
-				if (opts.bulk && isTransientHttp(e)) throw e;
 				console.warn("[mayaspace] createFile failed", path, e);
+				// bulk는 위로 던져 업로드 큐가 처리한다: 일시적(429/5xx/네트워크)은 백오프 재시도,
+				// 비복구(401/402/403/413)는 isTransient=false라 재시도 없이 failed로 집계된다.
+				// 과거엔 비복구 에러를 조용히 삼켜(processed로 위장) 누락을 숨겼다(관측성 회귀 수정).
+				if (opts.bulk) throw e;
+				// 단일 생성엔 큐가 없으니 사용자에게 직접 알린다(원문 본문은 노출하지 않음).
+				new Notice(`MayaSpace: 업로드 실패 (${httpStatusOf(e) ?? "네트워크"}) — 'Sync now'로 다시 시도하세요.`);
 				return;
 			}
 			this.settings.fileMappings[path] = { orgId, fileId: meta.id };
