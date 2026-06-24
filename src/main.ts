@@ -626,6 +626,12 @@ export default class MayaspacePlugin extends Plugin {
 	private registerVaultHandlers(): void {
 		this.registerEvent(
 			this.app.vault.on("create", (f) => {
+				// Obsidian은 리로드 시 기존 파일/폴더 전부에 'create'를 재생(replay)한다. 그 초기
+				// 폭풍을 그대로 처리하면 폴더마다 전체 vault 스캔(handleFolderCreate)·파일마다 enqueue가
+				// 터져 대형 vault 리로드가 O(폴더수×파일수)로 멈춘다. 진짜 새 파일/폴더 import는 layout
+				// 준비 *후*의 이벤트이고, 초기 동기화는 onLayoutReady의 syncTrees(+reconcileLocalOrphans)가
+				// 담당하므로 layout 준비 전 replay는 무시한다.
+				if (!this.app.workspace.layoutReady) return;
 				if (f instanceof TFile) {
 					// 모든 파일 create를 전역 큐로. 폴더 임포트 시 Obsidian이 안쪽 파일마다 개별
 					// create를 쏟아도(100개+) 동시성 상한으로 묶어 서버 풀·WS 폭주를 막는다.
