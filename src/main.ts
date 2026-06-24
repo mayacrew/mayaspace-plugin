@@ -33,7 +33,7 @@ import { shouldApplyPrefetch } from "./sync/prefetch-policy";
 import { debounce } from "./lib/debounce";
 import { mergeDiskIntoYtext } from "./lib/merge-disk-into-ytext";
 
-import { syncOrgTrees, findUnmappedLocalFiles, findUnmappedFilesUnderFolder, type FileMapping, type SyncResult } from "./vault/tree-sync";
+import { syncOrgTrees, findUnmappedLocalFiles, findUnmappedFilesUnderFolder, ensureFile, ensureParentFolders, type FileMapping, type SyncResult, type VaultLike } from "./vault/tree-sync";
 import { UploadQueue } from "./vault/upload-queue";
 import { createSaveScheduler, type SaveScheduler } from "./lib/save-scheduler";
 import { FileMappings } from "./vault/file-mappings";
@@ -115,6 +115,10 @@ export default class MayaspacePlugin extends Plugin {
 	private readonly hydratingPaths = new Set<string>();
 	// 대형 vault background drip 타이머(없으면 null).
 	private hydrateDripTimer: number | null = null;
+	// 이번 drip 사이클에서 이미 hydrate를 시도한 경로. 본문이 빈 파일은 hydrate해도 placeholder를
+	// 못 벗어나는데(size 0), 커서가 "남은 첫 placeholder"라 같은 빈 파일에서 무한 제자리(livelock)
+	// 했다. 시도한 건 건너뛰어 다음으로 진행한다. 새 사이클마다 비운다(빈 파일이 나중에 본문을 받으면 재시도).
+	private readonly dripAttempted = new Set<string>();
 	private settingTab: MayaspaceSettingTab | null = null;
 	private prefetches = new Map<string, () => void>();
 	// Most-recently-opened mapped paths, newest last. Bounds the live prefetch
@@ -911,6 +915,7 @@ export default class MayaspacePlugin extends Plugin {
 	/** 대형 vault용: 한가할 때 placeholder를 분당 N개씩 천천히 채운다(드립). */
 	private startBackgroundHydrate(): void {
 		if (this.hydrateDripTimer !== null) return; // 이미 도는 중
+		this.dripAttempted.clear(); // 새 사이클: 빈 파일 포함 전체 재평가
 		if (!this.nextPlaceholderToHydrate()) return; // 받을 게 없으면 시작 안 함
 		const perMinute = Math.max(1, this.settings.backgroundHydratePerMinute);
 		const intervalMs = Math.max(1000, Math.floor(60000 / perMinute));
@@ -928,11 +933,15 @@ export default class MayaspacePlugin extends Plugin {
 		const next = this.nextPlaceholderToHydrate();
 		if (!next) { this.stopBackgroundHydrate(); return; }
 		await this.hydrateFileTracked(next[0], next[1]);
+		// 본문이 빈 파일은 hydrate 후에도 placeholder로 남는다 — 시도 표시로 다음 틱에 건너뛰어
+		// 같은 파일에서 막히지 않게 한다. 본문 있는 파일은 local로 바뀌어 어차피 다시 안 잡힌다.
+		this.dripAttempted.add(next[0]);
 	}
 
 	/** 아직 본문이 없는(placeholder) 첫 매핑 파일. 없으면 null. */
 	private nextPlaceholderToHydrate(): [string, FileMapping] | null {
 		for (const [path, mapping] of Object.entries(this.settings.fileMappings)) {
+			if (this.dripAttempted.has(path)) continue; // 이미 시도함(빈 파일 livelock 방지)
 			if (this.hydratingPaths.has(path)) continue;
 			if (this.liveCollab.activePaths().includes(path)) continue;
 			if (this.contentStateFor(path) === "placeholder") return [path, mapping];
@@ -1339,8 +1348,15 @@ export default class MayaspacePlugin extends Plugin {
 						this.settings.filePermissions[p.fileId] =
 							p.effective_permissions ?? this.permsForNewPath(p.orgId, full);
 					}
-					if (!this.app.vault.getAbstractFileByPath(full)) {
-						try { await this.app.vault.create(full, ""); } catch { /* race */ }
+					// 부모 폴더를 먼저 만든 뒤 placeholder를 생성한다(syncOrgTrees와 동일 패턴).
+					// 새 하위폴더(예: bulk/.../)로 들어오는 대량 수신에서 폴더가 아직 없으면
+					// vault.create가 throw하는데, 과거엔 빈 catch가 조용히 삼켜 '매핑만 있고 파일
+					// 없는' 고아 상태를 만들었다(폴러가 영영 못 고침). 실패는 로깅한다.
+					try {
+						await ensureParentFolders(this.app.vault as unknown as VaultLike, full);
+						await ensureFile(this.app.vault as unknown as VaultLike, full);
+					} catch (e) {
+						console.warn("[mayaspace] onCreated placeholder failed", full, e);
 					}
 					await this.saveSettings();
 					this.decorator.refresh();

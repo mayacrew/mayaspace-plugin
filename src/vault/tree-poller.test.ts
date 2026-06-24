@@ -220,3 +220,64 @@ it("트리에 (재)등장한 파일 → addFileMapping + placeholder 생성 (재
 	expect(added).toContain("MayaSpace/Acme/taeho/back.md");
 	expect(vault._files.has("MayaSpace/Acme/taeho/back.md")).toBe(true);
 });
+
+it("매핑은 있는데 로컬 vault 파일이 없으면 placeholder를 재생성한다 (self-heal)", async () => {
+	// onCreated 누락·벌크 레이스로 '매핑만 있고 로컬 파일은 없는' 고아 상태가 생긴다.
+	// 폴러가 매핑만 보고 건너뛰면 그 파일은 영영 안 생긴다(reload만 고침). 로컬 파일이
+	// 없으면 다시 만들어야 한다.
+	const known: Record<string, { orgId: string; fileId: string }> = {
+		"MayaSpace/Acme/sub/0003.md": { orgId: "o1", fileId: "f3" },
+	};
+	const vault = makeVault(); // 매핑은 있지만 vault엔 파일 없음(고아 매핑)
+	const poller = new TreePoller(
+		{ listOrgs: async () => [{ id: "o1", name: "Acme", effective_permissions: 0 }],
+			getTree: async () => [{ id: "f3", path: "sub/0003.md", effective_permissions: 15 }] },
+		vault as any,
+		{
+			getKnownFiles: () => known,
+			addFileMapping: async (p, m) => { known[p] = m; },
+			removeFileMapping: async (p) => { delete known[p]; },
+			sanitizeOrgFolderName: (n) => n,
+			mayaspaceRoot: () => "MayaSpace",
+		},
+		1000,
+	);
+	await poller.tick();
+	expect(vault._files.has("MayaSpace/Acme/sub/0003.md")).toBe(true); // 재생성됨
+});
+
+it("한 파일 생성 실패가 같은 org의 다른 파일 생성을 막지 않는다 (틱 격리)", async () => {
+	// 한 파일의 vault.create 에러가 throw로 org 전체 틱을 중단시키면, 그 뒤 파일들이
+	// 안 생긴다(대형 vault 수렴 실패). 파일별로 격리해 실패는 onError로 보고하고 진행해야 한다.
+	const known: Record<string, { orgId: string; fileId: string }> = {};
+	const errors: unknown[] = [];
+	const vault = makeVault();
+	const origCreate = vault.create;
+	vault.create = async (p: string) => {
+		if (p === "MayaSpace/Acme/sub/bad.md") throw new Error("boom"); // 한 파일만 실패
+		return origCreate(p);
+	};
+	const poller = new TreePoller(
+		{ listOrgs: async () => [{ id: "o1", name: "Acme", effective_permissions: 0 }],
+			getTree: async () => [
+				{ id: "f1", path: "sub/good1.md", effective_permissions: 15 },
+				{ id: "f2", path: "sub/bad.md", effective_permissions: 15 },
+				{ id: "f3", path: "sub/good2.md", effective_permissions: 15 },
+			] },
+		vault as any,
+		{
+			getKnownFiles: () => known,
+			addFileMapping: async (p, m) => { known[p] = m; },
+			removeFileMapping: async (p) => { delete known[p]; },
+			sanitizeOrgFolderName: (n) => n,
+			mayaspaceRoot: () => "MayaSpace",
+			onError: (e) => { errors.push(e); },
+		},
+		1000,
+	);
+	await poller.tick();
+	expect(vault._files.has("MayaSpace/Acme/sub/good1.md")).toBe(true);
+	expect(vault._files.has("MayaSpace/Acme/sub/good2.md")).toBe(true); // bad 뒤에도 생성됨
+	expect(vault._files.has("MayaSpace/Acme/sub/bad.md")).toBe(false);
+	expect(errors.length).toBe(1); // 실패는 onError로 보고
+});

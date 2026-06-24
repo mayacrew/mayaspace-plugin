@@ -107,18 +107,31 @@ export class TreePoller {
 			serverFileIds.add(file.id);
 			this.hooks.onFilePermissions?.(file.id, file.effective_permissions ?? 0);
 			const known = this.hooks.getKnownFiles()[fullPath];
-			if (known && known.fileId === file.id) continue;
+			const fileExists = !!this.vault.getAbstractFileByPath(fullPath);
+			// 매핑도 있고 로컬 파일도 있으면 동기화 완료 — 건너뛴다. 매핑만 있고 로컬 파일이
+			// 없으면(누락 이벤트·벌크 레이스로 생긴 고아 매핑) 아래에서 placeholder를 재생성한다
+			// (self-heal). 매핑만 보고 건너뛰면 그 파일은 reload 전까지 영영 안 생긴다.
+			if (known && known.fileId === file.id && fileExists) continue;
 
-			await this.ensureParents(fullPath);
-			// Register mapping BEFORE creating the placeholder. vault.create
-			// fires the plugin's vault.on('create') handler synchronously; if
-			// the mapping isn't there yet, that handler treats our own
-			// placeholder as a user-created file and POSTs it to the server
-			// → 409 path-conflict.
-			await this.hooks.addFileMapping(fullPath, { orgId: org.id, fileId: file.id });
-			if (!this.vault.getAbstractFileByPath(fullPath)) {
-				try { await this.vault.create(fullPath, ""); }
-				catch (e) { if (!isAlreadyExists(e)) throw e; }
+			// 한 파일의 실패(폴더 생성·create 에러)가 throw로 org 전체 틱을 중단시키지 않게 격리한다.
+			// 중단되면 그 뒤 파일들이 안 생겨 대형 vault가 수렴하지 못한다. 실패는 onError로 보고하고
+			// 다음 파일로 진행 — 서버가 원본이라 실패한 파일은 다음 틱에 다시 시도된다.
+			try {
+				await this.ensureParents(fullPath);
+				// Register mapping BEFORE creating the placeholder. vault.create
+				// fires the plugin's vault.on('create') handler synchronously; if
+				// the mapping isn't there yet, that handler treats our own
+				// placeholder as a user-created file and POSTs it to the server
+				// → 409 path-conflict.
+				if (!(known && known.fileId === file.id)) {
+					await this.hooks.addFileMapping(fullPath, { orgId: org.id, fileId: file.id });
+				}
+				if (!fileExists) {
+					try { await this.vault.create(fullPath, ""); }
+					catch (e) { if (!isAlreadyExists(e)) throw e; }
+				}
+			} catch (e) {
+				this.hooks.onError?.(e);
 			}
 		}
 

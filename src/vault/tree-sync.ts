@@ -157,7 +157,7 @@ async function ensureFolder(vault: VaultLike, path: string): Promise<void> {
 	}
 }
 
-async function ensureFile(vault: VaultLike, path: string): Promise<void> {
+export async function ensureFile(vault: VaultLike, path: string): Promise<void> {
 	if (vault.getAbstractFileByPath(path)) return;
 	try {
 		await vault.create(path, "");
@@ -171,7 +171,7 @@ function isAlreadyExistsError(e: unknown): boolean {
 	return msg.includes("already exists");
 }
 
-async function ensureParentFolders(vault: VaultLike, fullPath: string): Promise<void> {
+export async function ensureParentFolders(vault: VaultLike, fullPath: string): Promise<void> {
 	const segments = fullPath.split("/");
 	segments.pop();
 	let acc = "";
