@@ -35,6 +35,7 @@ import { mergeDiskIntoYtext } from "./lib/merge-disk-into-ytext";
 
 import { syncOrgTrees, findUnmappedLocalFiles, findUnmappedFilesUnderFolder, type FileMapping, type SyncResult } from "./vault/tree-sync";
 import { UploadQueue } from "./vault/upload-queue";
+import { createSaveScheduler, type SaveScheduler } from "./lib/save-scheduler";
 import { FileMappings } from "./vault/file-mappings";
 import { TreePoller, type PollerVault } from "./vault/tree-poller";
 
@@ -78,6 +79,11 @@ export default class MayaspacePlugin extends Plugin {
 	// 같은 org 안의 파일 이동(rename)을 동시성 제한으로 흘려보내는 큐. 폴더째 100개 이동 시
 	// moveFile burst를 막는다. newPath를 키로 pendingMoves에서 상세를 조회한다.
 	private moveQueue!: UploadQueue;
+	// 로컬 삭제(서버 DELETE 전파)를 동시성 제한·재시도로 흘려보내는 큐. 폴더째 1000개 삭제 시
+	// deleteFile burst가 서버 풀을 고갈시키고(타임아웃 → 실패) 메인 스레드를 막는 것을 방지한다.
+	private deleteQueue!: UploadQueue;
+	// 잦은 매핑 변경을 1회 디스크 쓰기로 합치는 저장 스케줄러(대량 삭제 시 O(N²) saveSettings 방지).
+	private saveScheduler!: SaveScheduler;
 	private readonly pendingMoves = new Map<string, { oldPath: string; orgId: string; fileId: string; newRelPath: string }>();
 	// cross-org로 옮겨져 차단된 새 경로(세션 한정). handleVaultCreate가 이 경로의 업로드를 막는다.
 	private readonly crossOrgBlocked = new Set<string>();
@@ -200,6 +206,7 @@ export default class MayaspacePlugin extends Plugin {
 	}
 
 	async onunload(): Promise<void> {
+		await this.saveScheduler?.flush(); // 디바운스 대기 중인 매핑 변경을 잃지 않게 먼저 비운다
 		this.treePoller?.stop();
 		if (this.fileOpenTimer) clearTimeout(this.fileOpenTimer);
 		this.events?.unsubscribeAll();
@@ -325,6 +332,8 @@ export default class MayaspacePlugin extends Plugin {
 	}
 
 	private buildQueues(): void {
+		this.saveScheduler = createSaveScheduler(() => this.saveSettings(), SAVE_DEBOUNCE_MS);
+
 		this.uploadQueue = new UploadQueue({
 			concurrency: UPLOAD_CONCURRENCY,
 			maxAttempts: UPLOAD_MAX_ATTEMPTS,
@@ -368,6 +377,21 @@ export default class MayaspacePlugin extends Plugin {
 			onSettled: (s) => {
 				this.uploadStatusItem?.setText("");
 				if (s.failed > 0) new Notice(`MayaSpace: ${s.failed}개 이동 실패 — 다시 시도하세요.`);
+			},
+		});
+
+		this.deleteQueue = new UploadQueue({
+			concurrency: UPLOAD_CONCURRENCY,
+			maxAttempts: UPLOAD_MAX_ATTEMPTS,
+			backoffMs: (attempt) => Math.min(UPLOAD_BACKOFF_BASE_MS * 2 ** (attempt - 1), UPLOAD_BACKOFF_MAX_MS),
+			upload: (path) => this.handleVaultDelete(path),
+			isTransient: isTransientHttp,
+			sleep,
+			log: (m) => console.log("[mayaspace][delete]", m),
+			onProgress: (done, total) => this.uploadStatusItem?.setText(done < total ? `MayaSpace: 삭제 ${done}/${total}` : ""),
+			onSettled: (s) => {
+				this.uploadStatusItem?.setText("");
+				if (s.failed > 0) new Notice(`MayaSpace: ${s.failed}개 삭제 실패 — 'Sync now'로 다시 시도하세요.`);
 			},
 		});
 	}
@@ -627,7 +651,11 @@ export default class MayaspacePlugin extends Plugin {
 		this.registerEvent(
 			this.app.vault.on("delete", (f) => {
 				if (!(f instanceof TFile)) return;
-				this.handleVaultDelete(f.path).catch((e) => console.warn("[mayaspace] delete", e));
+				// 폴더째 삭제 시 Obsidian이 파일마다 개별 delete를 쏟아도(1000개+) 동시성 상한으로
+				// 묶어 서버 DELETE 폭주를 막는다(생성 경로의 uploadQueue와 대칭). 매핑 없는 일반
+				// 파일은 handleVaultDelete가 어차피 early-return하므로 큐에 넣지 않는다.
+				if (!this.settings.fileMappings[f.path]) return;
+				this.deleteQueue.enqueue(f.path);
 			}),
 		);
 		this.registerEvent(
@@ -1326,25 +1354,33 @@ export default class MayaspacePlugin extends Plugin {
 				},
 				onDeleted: async (p) => {
 					console.log("[mayaspace] SSE onDeleted", p);
-					for (const [path, m] of Object.entries(this.settings.fileMappings)) {
-						if (m.orgId !== p.orgId || m.fileId !== p.fileId) continue;
-						// Tear down the live editor binding BEFORE purgeDoc destroys
-						// the doc. Otherwise the yCollab ViewPlugin keeps transacting
-						// on a destroyed Y.Doc and the edits silently stop syncing.
-						if (this.liveCollab.activePaths().includes(path)) {
-							await this.liveCollab.detach(path).catch(() => undefined);
-						}
-						this.stopPrefetch(path);
-						void this.sync.purgeDoc(m.orgId, m.fileId).catch(() => undefined);
-						// Delete mapping BEFORE vault.delete. Otherwise vault.delete
-						// fires vault.on('delete') → handleVaultDelete sees the
-						// mapping and POSTs DELETE to the server for an already-
-						// deleted file.
-						delete this.settings.fileMappings[path];
-						const f = this.app.vault.getAbstractFileByPath(path);
-						if (f) await this.app.vault.delete(f).catch(() => undefined);
+					// 페이로드 경로로 로컬 경로를 계산해 O(1)로 찾는다(onCreated와 동일). 매핑 전체를
+					// 스캔하지 않는다 — 폴더째 삭제 시 이벤트마다의 풀스캔이 O(N²)가 되기 때문.
+					const folder = this.findOrgFolder(p.orgId);
+					if (!folder) return;
+					let relPath: string;
+					try { relPath = canonicalServerPath(p.path); }
+					catch (e) { console.warn("[mayaspace] onDeleted rejected path", p.path, e); return; }
+					const path = `${this.settings.mayaspaceRoot}/${folder}/${relPath}`;
+					const m = this.settings.fileMappings[path];
+					if (!m || m.orgId !== p.orgId || m.fileId !== p.fileId) return; // 우리 매핑 아님/이미 정리됨
+
+					// Tear down the live editor binding BEFORE purgeDoc destroys
+					// the doc. Otherwise the yCollab ViewPlugin keeps transacting
+					// on a destroyed Y.Doc and the edits silently stop syncing.
+					if (this.liveCollab.activePaths().includes(path)) {
+						await this.liveCollab.detach(path).catch(() => undefined);
 					}
-					await this.saveSettings();
+					this.stopPrefetch(path);
+					void this.sync.purgeDoc(m.orgId, m.fileId).catch(() => undefined);
+					// Delete mapping BEFORE vault.delete. Otherwise vault.delete
+					// fires vault.on('delete') → handleVaultDelete sees the
+					// mapping and POSTs DELETE to the server for an already-
+					// deleted file.
+					delete this.settings.fileMappings[path];
+					const f = this.app.vault.getAbstractFileByPath(path);
+					if (f) await this.app.vault.delete(f).catch(() => undefined);
+					this.saveScheduler.schedule();
 					this.decorator.refresh();
 				},
 				onMoved: async (p) => {
@@ -1775,10 +1811,14 @@ export default class MayaspacePlugin extends Plugin {
 		try {
 			await this.api.deleteFile(mapping.orgId, mapping.fileId);
 		} catch (e) {
-			console.warn("[mayaspace] deleteFile failed", path, e);
+			// 일시적 실패(타임아웃·429·5xx)는 큐가 백오프 재시도하도록 위로 던진다 — 매핑을
+			// 지우지 않아 다음 시도가 같은 파일을 다시 삭제할 수 있게 한다. 대량 삭제 burst로
+			// 깨진 deleteFile이 여기서 복구된다. 404는 이미 삭제된 것이라 멱등 처리(로그 생략).
+			if (isTransientHttp(e)) throw e;
+			if (httpStatusOf(e) !== 404) console.warn("[mayaspace] deleteFile failed", path, e);
 		}
 		delete this.settings.fileMappings[path];
-		await this.saveSettings();
+		this.saveScheduler.schedule();
 		this.decorator.refresh();
 	}
 
@@ -1925,6 +1965,8 @@ const UPLOAD_CONCURRENCY = 4;
 const UPLOAD_MAX_ATTEMPTS = 5;
 const UPLOAD_BACKOFF_BASE_MS = 500;
 const UPLOAD_BACKOFF_MAX_MS = 8000;
+// 대량 변경 시 매 건 saveSettings 대신 디스크 쓰기를 이 창으로 합친다(메모리는 즉시 반영).
+const SAVE_DEBOUNCE_MS = 500;
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Debounce for file-open → live-collab (re)bind. Long enough to coalesce rapid
