@@ -148,6 +148,34 @@ export function findUnmappedFilesUnderFolder(
 	return findUnmappedLocalFiles(under, knownPaths, mayaspaceRoot, orgFolders);
 }
 
+/**
+ * 동기화 직전 매핑(before) 중, 권위 있는 재동기화 결과(result)의 서버 트리에서 사라진 것 =
+ * 권한 회수(또는 삭제)된 파일을 돌려준다(순수 함수). 호출부가 이 파일들의 로컬 .md·CRDT·세션을
+ * 지운다 — runTreeSync는 매핑을 서버 트리로 통째 교체하기만 해서, 회수된 파일의 로컬 흔적이
+ * 매핑만 빠진 채 고아로 남기 때문이다.
+ *
+ * - 이번에 동기화된 org(result.orgs)만 대상 — 동기화 실패/누락된 org는 건드리지 않는다(안전).
+ * - fileId가 result에 여전히 있으면 이동(다른 경로로)이므로 회수가 아니다 — 제외한다.
+ * - 경로는 NFC로 정규화해 비교한다(macOS NFD 매핑 키 ↔ 서버 NFC 경로 오판 방지).
+ */
+export function findRevokedMappings(
+	before: Record<string, FileMapping>,
+	result: SyncResult,
+): Array<[string, FileMapping]> {
+	const syncedOrgIds = new Set(Object.values(result.orgs));
+	const serverPaths = new Set(Object.keys(result.files).map((p) => p.normalize("NFC")));
+	const serverFileIds = new Set(Object.values(result.files).map((m) => m.fileId));
+
+	const revoked: Array<[string, FileMapping]> = [];
+	for (const [path, mapping] of Object.entries(before)) {
+		if (!syncedOrgIds.has(mapping.orgId)) continue;
+		if (serverPaths.has(path.normalize("NFC"))) continue;
+		if (serverFileIds.has(mapping.fileId)) continue;
+		revoked.push([path, mapping]);
+	}
+	return revoked;
+}
+
 async function ensureFolder(vault: VaultLike, path: string): Promise<void> {
 	if (vault.getAbstractFileByPath(path)) return;
 	try {

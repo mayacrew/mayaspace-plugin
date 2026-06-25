@@ -1,4 +1,56 @@
-import { syncOrgTrees, findUnmappedLocalFiles, findUnmappedFilesUnderFolder, type VaultLike, type ApiLike } from "./tree-sync";
+import {
+	syncOrgTrees,
+	findUnmappedLocalFiles,
+	findUnmappedFilesUnderFolder,
+	findRevokedMappings,
+	type VaultLike,
+	type ApiLike,
+	type SyncResult,
+} from "./tree-sync";
+
+describe("findRevokedMappings", () => {
+	const result = (
+		orgs: Record<string, string>,
+		files: Record<string, { orgId: string; fileId: string }>,
+	): SyncResult => ({ orgs, files });
+
+	test("동기화 후 서버 트리에서 빠진 매핑(권한 회수)을 돌려준다", () => {
+		const before = {
+			"MayaSpace/Acme/bulk/keep.md": { orgId: "o1", fileId: "f-keep" },
+			"MayaSpace/Acme/bulk/revoked.md": { orgId: "o1", fileId: "f-rev" },
+		};
+		const r = result({ Acme: "o1" }, { "MayaSpace/Acme/bulk/keep.md": { orgId: "o1", fileId: "f-keep" } });
+		expect(findRevokedMappings(before, r)).toEqual([
+			["MayaSpace/Acme/bulk/revoked.md", { orgId: "o1", fileId: "f-rev" }],
+		]);
+	});
+
+	test("이동된 파일(fileId가 새 경로로 살아 있음)은 회수로 보지 않는다", () => {
+		const before = { "MayaSpace/Acme/old.md": { orgId: "o1", fileId: "f1" } };
+		const r = result({ Acme: "o1" }, { "MayaSpace/Acme/new.md": { orgId: "o1", fileId: "f1" } });
+		expect(findRevokedMappings(before, r)).toEqual([]);
+	});
+
+	test("동기화되지 않은 org의 매핑은 건드리지 않는다 (부분 실패 안전)", () => {
+		const before = { "MayaSpace/Other/a.md": { orgId: "o2", fileId: "fa" } };
+		const r = result({ Acme: "o1" }, {}); // o2는 이번 동기화에 없음
+		expect(findRevokedMappings(before, r)).toEqual([]);
+	});
+
+	test("NFD 로컬 경로를 NFC 서버 경로와 같게 본다 (정규화 오판 방지)", () => {
+		const nfd = "MayaSpace/Acme/가나다.md".normalize("NFD");
+		const nfc = "MayaSpace/Acme/가나다.md".normalize("NFC");
+		const before = { [nfd]: { orgId: "o1", fileId: "f1" } };
+		const r = result({ Acme: "o1" }, { [nfc]: { orgId: "o1", fileId: "f1" } });
+		expect(findRevokedMappings(before, r)).toEqual([]);
+	});
+
+	test("빠진 게 없으면 빈 배열", () => {
+		const before = { "MayaSpace/Acme/a.md": { orgId: "o1", fileId: "fa" } };
+		const r = result({ Acme: "o1" }, { "MayaSpace/Acme/a.md": { orgId: "o1", fileId: "fa" } });
+		expect(findRevokedMappings(before, r)).toEqual([]);
+	});
+});
 
 function makeVault() {
 	const existing = new Set<string>();
