@@ -33,7 +33,7 @@ import { shouldApplyPrefetch } from "./sync/prefetch-policy";
 import { debounce } from "./lib/debounce";
 import { mergeDiskIntoYtext } from "./lib/merge-disk-into-ytext";
 
-import { syncOrgTrees, findUnmappedLocalFiles, findUnmappedFilesUnderFolder, ensureFile, ensureParentFolders, type FileMapping, type SyncResult, type VaultLike } from "./vault/tree-sync";
+import { syncOrgTrees, findUnmappedLocalFiles, findUnmappedFilesUnderFolder, findRevokedMappings, ensureFile, ensureParentFolders, type FileMapping, type SyncResult, type VaultLike } from "./vault/tree-sync";
 import { UploadQueue } from "./vault/upload-queue";
 import { createSaveScheduler, type SaveScheduler } from "./lib/save-scheduler";
 import { FileMappings } from "./vault/file-mappings";
@@ -101,7 +101,7 @@ export default class MayaspacePlugin extends Plugin {
 	private lastTreeChangeAt = 0;
 	// 서버 access.changed 신호 → 권한 즉시 재동기화. 짧게 몰아쳐도 한 번만 돌도록 디바운스.
 	private readonly resyncOnAccessChange = debounce(() => {
-		void this.syncTrees().catch((e) => console.warn("[mayaspace] access.changed resync", e));
+		void this.syncTrees({ pruneRevoked: true }).catch((e) => console.warn("[mayaspace] access.changed resync", e));
 	}, 800);
 	// 서버 tree.changed 신호(I1 burst coalesce) → 트리 재동기화. 디바운스로 묶는다.
 	private readonly resyncOnTreeChange = debounce(() => {
@@ -168,7 +168,7 @@ export default class MayaspacePlugin extends Plugin {
 		this.app.workspace.onLayoutReady(async () => {
 			this.decorator.refresh();
 			if (this.settings.tokenSet) {
-				await this.syncTrees().catch((e) => console.warn("[mayaspace] initial sync", e));
+				await this.syncTrees({ pruneRevoked: true }).catch((e) => console.warn("[mayaspace] initial sync", e));
 				this.startEventsSubscription();
 				this.restartTreePoller();
 			}
@@ -303,7 +303,7 @@ export default class MayaspacePlugin extends Plugin {
 		this.buildLiveCollab();
 
 		if (!this.settings.tokenSet) return;
-		await this.syncTrees().catch((e) => console.warn("[mayaspace] restartBackend sync", e));
+		await this.syncTrees({ pruneRevoked: true }).catch((e) => console.warn("[mayaspace] restartBackend sync", e));
 		this.startEventsSubscription();
 		this.restartTreePoller();
 	}
@@ -492,7 +492,7 @@ export default class MayaspacePlugin extends Plugin {
 		this.addCommand({
 			id: "sync-trees",
 			name: "MayaSpace: Sync org trees",
-			callback: () => this.syncTrees().catch((e) => new Notice(`Sync failed: ${describe(e)}`)),
+			callback: () => this.syncTrees({ pruneRevoked: true }).catch((e) => new Notice(`Sync failed: ${describe(e)}`)),
 		});
 		this.addCommand({
 			id: "open-admin",
@@ -713,7 +713,7 @@ export default class MayaspacePlugin extends Plugin {
 	private postAuthSuccess = async (): Promise<void> => {
 		await this.refreshAccount();
 		this.refreshSettingTab();
-		await this.syncTrees().catch((e) => new Notice(`Sync failed: ${describe(e)}`));
+		await this.syncTrees({ pruneRevoked: true }).catch((e) => new Notice(`Sync failed: ${describe(e)}`));
 		this.startEventsSubscription();
 		this.restartTreePoller();
 	};
@@ -789,19 +789,23 @@ export default class MayaspacePlugin extends Plugin {
 
 	// ---------- Tree sync ----------
 
-	async syncTrees(): Promise<void> {
+	// pruneRevoked: 권위 있는 동기화(로그인·수동·access.changed·재연결)에서만 true. 동기화 후
+	// 서버 트리에서 빠진 매핑을 회수로 보고 로컬 .md까지 지운다. tree.changed(벌크 coalesce)는
+	// 부분 트리일 수 있어 false — 그쪽 삭제는 폴러(대량삭제 가드)가 보수적으로 처리한다.
+	async syncTrees(opts: { pruneRevoked?: boolean } = {}): Promise<void> {
 		if (!this.settings.tokenSet) return;
 		// 동시 실행 방지: access.changed·startup·로그인·수동 호출이 겹쳐도 한 번만 돈다.
 		if (this.syncingTrees) return;
 		this.syncingTrees = true;
 		try {
-			await this.runTreeSync();
+			await this.runTreeSync(opts);
 		} finally {
 			this.syncingTrees = false;
 		}
 	}
 
-	private async runTreeSync(): Promise<void> {
+	private async runTreeSync(opts: { pruneRevoked?: boolean } = {}): Promise<void> {
+		const before = opts.pruneRevoked ? { ...this.settings.fileMappings } : null;
 		const result = await syncOrgTrees(
 			this.app.vault as unknown as Parameters<typeof syncOrgTrees>[0],
 			this.api,
@@ -822,6 +826,9 @@ export default class MayaspacePlugin extends Plugin {
 		this.settings.orgMappings = result.orgs;
 		this.settings.fileMappings = result.files;
 		await this.saveSettings();
+		// 권한 회수: 매핑은 위에서 서버 트리로 교체돼 빠졌지만 로컬 .md·CRDT·세션은 남는다.
+		// before와 비교해 회수된 파일의 로컬 흔적을 마저 지운다(보안: 회수 유저가 계속 못 읽게).
+		if (before) await this.pruneRevokedFiles(before, result);
 		// 누락된 create 이벤트로 매핑 없이 남은 org 폴더 내 로컬 파일을 서버로 업로드(자가복구).
 		await this.reconcileLocalOrphans(result);
 		this.decorator.refresh();
@@ -853,6 +860,37 @@ export default class MayaspacePlugin extends Plugin {
 		// 전역 업로드 큐로(bulk) — 동시성 제한 + 재시도. 권한 없는 파일은 handleVaultCreate가 조용히 스킵.
 		console.log(`[mayaspace] reconcile: queueing ${orphans.length} orphaned local file(s)`);
 		this.uploadQueue.enqueueAll(orphans);
+	}
+
+	/**
+	 * 권위 있는 동기화 후, 서버 트리에서 빠진 매핑(=권한 회수/삭제)의 로컬 흔적을 마저 지운다.
+	 * 안전장치: 서버가 빈 트리를 돌려준 건 회수가 아니라 응답 열화일 수 있으니 전부 지우지 않는다.
+	 */
+	private async pruneRevokedFiles(before: Record<string, FileMapping>, result: SyncResult): Promise<void> {
+		if (Object.keys(result.files).length === 0) return;
+		const revoked = findRevokedMappings(before, result);
+		if (revoked.length === 0) return;
+		for (const [path, mapping] of revoked) await this.removeRevokedFileLocally(path, mapping);
+		await this.saveSettings();
+		this.decorator.refresh();
+		new Notice(`MayaSpace: 접근 권한이 회수되어 ${revoked.length}개 파일을 로컬에서 제거했습니다.`);
+	}
+
+	/**
+	 * 회수/삭제된 파일의 로컬 흔적 제거: prefetch 중단·세션 detach·CRDT purge·매핑/권한 삭제·.md 삭제.
+	 * .md까지 지우는 이유: 동기화본이 남으면 회수된 유저가 계속 읽을 수 있다(보안). 매핑을 먼저 지워
+	 * vault.delete가 부르는 handleVaultDelete가 이미 권한 없는 파일을 서버에 또 DELETE하지 않게 한다.
+	 */
+	private async removeRevokedFileLocally(path: string, mapping: FileMapping): Promise<void> {
+		this.stopPrefetch(path);
+		if (this.liveCollab.activePaths().includes(path)) {
+			await this.liveCollab.detach(path).catch(() => undefined);
+		}
+		await this.sync.purgeDoc(mapping.orgId, mapping.fileId).catch(() => undefined);
+		delete this.settings.fileMappings[path];
+		delete this.settings.filePermissions[mapping.fileId];
+		const f = this.app.vault.getAbstractFileByPath(path);
+		if (f) await this.app.vault.delete(f).catch(() => undefined);
 	}
 
 	/**
